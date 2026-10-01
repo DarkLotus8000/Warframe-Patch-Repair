@@ -1,2 +1,4 @@
 pefile>=2023.2.7
 capstone>=5.0.1
+google-crc32c>=1.9.0
+pycurl>=7.48.0

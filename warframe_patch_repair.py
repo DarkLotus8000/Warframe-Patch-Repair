@@ -11,22 +11,37 @@ import errno
 import hashlib
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
-import shutil
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+try:
+    import google_crc32c as _google_crc32c  # type: ignore
+except (ImportError, OSError):
+    _google_crc32c = None
+
+try:
+    import pycurl as _pycurl  # type: ignore
+except (ImportError, OSError):
+    _pycurl = None
+
 CDN_BASE = "https://content.warframe.com/"
+H_CACHE_ORIGIN_BASE = "https://origin.warframe.com/origin/00000000/0/"
+H_CACHE_SENTINEL_HASH = "---------------------w"
 HTTP_TIMEOUT = 30
 HTTP_ATTEMPTS = 3
+HTTP_MAX_REDIRECTS = 5
+H_CACHE_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_HTTP_STATUS_LINE_RE = re.compile(br"^HTTP/\S+\s+(\d{3})(?:\s|$)")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -34,12 +49,18 @@ USER_AGENT = (
 )
 
 # The full release archive bundles the exact Oodle runtime used by the repair
-# tool next to this script. Keep its pinned identity so a damaged or replaced
+# script. Keep its pinned identity so a damaged or replaced
 # DLL fails explicitly instead of producing misleading decompression errors.
 OODLE_DLL_NAME = "oo2core_9.dll"
 OODLE_X64_SHA256 = "19452ae1abae65e1305d3818354d4fae7b1200294322f0d9c6d5ddeb7bd9f978"
 OODLE_X64_SIZE = 582656
 SUPPORTED_MANIFEST_VERSION = 14
+MANIFEST_INFO_SIZE_MASK = 0x0FFFFFFF
+MANIFEST_INFO_FLAGS_SHIFT = 28
+DOWNLOAD_SPEED_WINDOW_SECONDS = 8.0
+DOWNLOAD_ETA_MIN_SAMPLE_SECONDS = 1.0
+DEFAULT_DOWNLOAD_WORKERS = 2
+MAX_DOWNLOAD_WORKERS = 16
 VERIFY_PROGRESS_MIN_BYTES = 16 * 1024 * 1024
 DISK_LOW_WARNING_BYTES = 1 * 1024 * 1024 * 1024
 DISK_SAFETY_HEADROOM_BYTES = 64 * 1024 * 1024
@@ -47,6 +68,7 @@ DISK_WAIT_INTERVAL_SECONDS = 0.5
 _WINDOWS_MAX_COMPONENT_UTF16 = 255
 _WINDOWS_MAX_PATH_UTF16 = 32760
 _LOW_DISK_WARNED: set[str] = set()
+_CURL_LOCAL = threading.local()
 
 ANSI_GREEN = "\x1b[92m"
 ANSI_YELLOW = "\x1b[93m"
@@ -55,6 +77,9 @@ ANSI_CYAN = "\x1b[36m"
 ANSI_RESET = "\x1b[0m"
 ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _COLOR_SUPPORT: dict[int, bool] = {}
+
+ManifestAssetKey = tuple[str, str, str]
+ManifestRepairResult = tuple[str, str | None, str | None, int | None]
 
 def _enable_console_colors(stream) -> bool:
     key = id(stream)
@@ -141,6 +166,16 @@ def _format_bytes(value: int) -> str:
                 return f"{int(size)} {unit}"
             return f"{size:.1f} {unit}"
         size /= 1024.0
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds + 0.5))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
     return singular if count == 1 else (plural or f"{singular}s")
@@ -302,7 +337,12 @@ class TransientLine:
             max(0, self._previous_width - visible_width),
             max_padding,
         )
-        sys.stdout.write("\r" + styled_text + padding)
+        # After erasing a stale tail, move the visible console cursor back to
+        # the end of the current frame instead of leaving it at the end of the
+        # invisible padding. Backspace works in the classic Windows console too,
+        # so this does not require VT cursor-positioning support.
+        cursor_back = "\b" * len(padding)
+        sys.stdout.write("\r" + styled_text + padding + cursor_back)
         sys.stdout.flush()
         self._previous_width = visible_width
         self._visible = True
@@ -485,6 +525,148 @@ class DownloadProgress:
     def finish(self, *, defer_flush: bool = False) -> None:
         self.line.finish(defer_flush=defer_flush)
 
+class OverallDownloadProgress:
+    def __init__(self, total: int, files_total: int):
+        self.total = max(0, int(total))
+        self.files_total = max(0, int(files_total))
+        self.completed = 0
+        self.files_completed = 0
+        self.wire_bytes = 0
+        self._active: dict[int, tuple[str, int, int]] = {}
+        self._lock = threading.RLock()
+        now = time.monotonic()
+        self.samples: deque[tuple[float, int]] = deque([(now, 0)])
+        self.line = TransientLine(show_after=0.0)
+
+    def _speed(self, now: float) -> float:
+        if not self.samples or self.samples[-1][1] != self.wire_bytes:
+            self.samples.append((now, self.wire_bytes))
+        while (
+            len(self.samples) > 1
+            and now - self.samples[0][0] > DOWNLOAD_SPEED_WINDOW_SECONDS
+        ):
+            self.samples.popleft()
+        if len(self.samples) < 2:
+            return 0.0
+        elapsed = self.samples[-1][0] - self.samples[0][0]
+        if elapsed < DOWNLOAD_ETA_MIN_SAMPLE_SECONDS:
+            return 0.0
+        return (self.samples[-1][1] - self.samples[0][1]) / elapsed
+
+    def _render(self, *, force: bool = False) -> None:
+        if not self.line.interactive:
+            return
+        now = time.monotonic()
+        speed = self._speed(now)
+        active_bytes = sum(active for _name, _planned, active in self._active.values())
+        current = self.completed + active_bytes
+        if self.total:
+            current = min(self.total, current)
+            percent = min(100.0, current * 100.0 / self.total)
+            progress = (
+                f"{_format_bytes(current)} / {_format_bytes(self.total)} "
+                f"({percent:.1f}%)"
+            )
+        else:
+            progress = _format_bytes(current)
+
+        speed_text = f"{_format_bytes(int(speed))}/s" if speed > 0 else "calculating..."
+        remaining = max(0, self.total - current)
+        eta_text = (
+            f"ETA {_format_duration(remaining / speed)}"
+            if speed > 0 and self.total > 0
+            else "ETA calculating..."
+        )
+        file_text = (
+            f"{self.files_completed}/{self.files_total} files"
+            if self.files_total
+            else "0 files"
+        )
+        plain_prefix = f"[Download] {progress} | {speed_text} | {eta_text} | {file_text}"
+        styled_prefix = (
+            f"[Download] {_color(progress, ANSI_CYAN, sys.stdout)} | "
+            f"{speed_text} | {eta_text} | {file_text}"
+        )
+
+        width = max(20, shutil.get_terminal_size((120, 24)).columns)
+        max_width = max(1, width - 1)
+        if len(plain_prefix) > max_width:
+            plain_prefix = f"[Download] {progress} | {speed_text} | {eta_text}"
+            styled_prefix = (
+                f"[Download] {_color(progress, ANSI_CYAN, sys.stdout)} | "
+                f"{speed_text} | {eta_text}"
+            )
+        if len(plain_prefix) > max_width:
+            plain_prefix = f"[Download] {progress} | {speed_text}"
+            styled_prefix = (
+                f"[Download] {_color(progress, ANSI_CYAN, sys.stdout)} | {speed_text}"
+            )
+        if len(plain_prefix) > max_width and self.total > 0:
+            percent = min(100.0, current * 100.0 / self.total)
+            progress = f"{percent:.1f}%"
+            plain_prefix = f"[Download] {progress} | {speed_text}"
+            styled_prefix = (
+                f"[Download] {_color(progress, ANSI_CYAN, sys.stdout)} | {speed_text}"
+            )
+        if len(plain_prefix) > max_width:
+            plain_prefix = f"[Download] {progress}"
+            styled_prefix = f"[Download] {_color(progress, ANSI_CYAN, sys.stdout)}"
+
+        self.line.render(styled_prefix, plain_prefix, force=force)
+
+    def start_attempt(self, name: str, planned_size: int | None) -> None:
+        with self._lock:
+            self._active[threading.get_ident()] = (
+                name,
+                max(0, int(planned_size or 0)),
+                0,
+            )
+            self._render(force=True)
+
+    def update(self, amount: int, *, force: bool = False) -> None:
+        with self._lock:
+            thread_id = threading.get_ident()
+            active = self._active.get(thread_id)
+            if active is None:
+                return
+            name, planned, current = active
+            amount = max(0, int(amount))
+            self._active[thread_id] = (name, planned, current + amount)
+            self.wire_bytes += amount
+            self._render(force=force)
+
+    def commit_attempt(self, actual_size: int) -> None:
+        with self._lock:
+            active = self._active.pop(threading.get_ident(), None)
+            if active is None:
+                return
+            _name, planned_size, _current = active
+            actual_size = max(0, int(actual_size))
+            if planned_size != actual_size:
+                self.total = max(0, self.total + actual_size - planned_size)
+            self.completed += actual_size
+            self.files_completed += 1
+            self._render(force=True)
+
+    def rollback_attempt(self) -> None:
+        with self._lock:
+            if self._active.pop(threading.get_ident(), None) is None:
+                return
+            self._render(force=True)
+
+    @contextmanager
+    def message_scope(self):
+        with self._lock:
+            self.line.finish()
+            try:
+                yield
+            finally:
+                self._render(force=True)
+
+    def finish(self) -> None:
+        with self._lock:
+            self.line.finish()
+
 @contextmanager
 def windows_quick_edit_disabled():
     """Prevent classic Windows QuickEdit selection from pausing repair work."""
@@ -535,6 +717,13 @@ MANIFEST_RE = re.compile(
     r"^B\.Cache\.(?P<kind>Windows|Dx11(?!_)|Dx12(?!_))"
     r"(?P<suffix>_[A-Za-z0-9]+)?\.bin!"
     r"(?P<type>[0-9A-Fa-f]+)_(?P<hash>[A-Za-z0-9+\-]+)$"
+)
+H_CACHE_B_CACHE_RE = re.compile(
+    r"^/B\.Cache\.(?P<kind>Windows|Dx11(?!_)|Dx12(?!_))"
+    r"(?P<suffix>_[A-Za-z0-9]+)?\.bin$"
+)
+H_CACHE_FILE_RE = re.compile(
+    r"^H\.Cache\.bin!(?P<type>[0-9A-Fa-f]+)_" + re.escape(H_CACHE_SENTINEL_HASH) + r"$"
 )
 
 OPENWF_404_RE = re.compile(
@@ -1149,13 +1338,26 @@ def find_warframe_exe(target_root: Path) -> Path | None:
 @dataclass(frozen=True, slots=True)
 class PatchTypeEvidence:
     exact_types: dict[tuple[str, str], int]
+    group_exact_types: dict[tuple[str, str], int]
     parent_types: dict[tuple[str, str], int]
     pattern_types: dict[tuple[str, str], int]
-    exact_objects: dict[tuple[str, str, str], ObservedObject]
+    exact_objects: dict[ManifestAssetKey, ObservedObject]
     observations: int
 
 def _namespace_group(namespace: str) -> str:
     return "0" if namespace.startswith("0") else namespace
+
+def _group_namespace_type_hints(
+    hints: dict[tuple[str, str], int],
+) -> dict[tuple[str, str], int]:
+    grouped: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
+    for (namespace, logical_path), type_id in hints.items():
+        grouped[(_namespace_group(namespace), logical_path)][type_id] += 1
+    return {
+        key: next(iter(counter))
+        for key, counter in grouped.items()
+        if len(counter) == 1
+    }
 
 class TypeResolver:
     def __init__(
@@ -1303,6 +1505,10 @@ class TypeResolver:
             return exact, "existing patch object"
 
         group = _namespace_group(namespace)
+        group_exact = evidence.group_exact_types.get((group, logical_path))
+        if group_exact is not None:
+            return group_exact, "patch-local same-path namespace-group evidence"
+
         if self.packages is not None:
             for parent in _packages_parent_chain(logical_path, self.packages.parents):
                 type_id = evidence.parent_types.get((group, parent))
@@ -1385,10 +1591,11 @@ def build_patch_type_evidence(
     current_tables: ExeTypeTables | None,
 ) -> PatchTypeEvidence:
     exact_counts: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
+    group_exact_counts: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
     parent_counts: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
     pattern_counts: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
     exact_object_candidates: dict[
-        tuple[str, str, str], dict[int, ObservedObject]
+        ManifestAssetKey, dict[int, ObservedObject]
     ] = defaultdict(dict)
     patterns = _candidate_learning_patterns(current_tables, observations)
 
@@ -1396,12 +1603,13 @@ def build_patch_type_evidence(
     try:
         for index, observation in enumerate(observations, 1):
             exact_counts[(observation.namespace, observation.logical_path)][observation.type_id] += 1
+            group = _namespace_group(observation.namespace)
+            group_exact_counts[(group, observation.logical_path)][observation.type_id] += 1
             exact_object_candidates[
                 (observation.namespace, observation.logical_path, observation.expected_hash)
             ].setdefault(observation.type_id, observation)
 
             if observation.logical_path.startswith(("/Lotus/", "/EE/", "/Temp/")):
-                group = _namespace_group(observation.namespace)
                 if packages is not None:
                     for parent in _packages_parent_chain(observation.logical_path, packages.parents):
                         parent_counts[(group, parent)][observation.type_id] += 1
@@ -1419,6 +1627,11 @@ def build_patch_type_evidence(
     exact_types = {
         key: next(iter(counter))
         for key, counter in exact_counts.items()
+        if len(counter) == 1
+    }
+    group_exact_types = {
+        key: next(iter(counter))
+        for key, counter in group_exact_counts.items()
         if len(counter) == 1
     }
     parent_types = {
@@ -1439,6 +1652,7 @@ def build_patch_type_evidence(
 
     return PatchTypeEvidence(
         exact_types=exact_types,
+        group_exact_types=group_exact_types,
         parent_types=parent_types,
         pattern_types=pattern_types,
         exact_objects=exact_objects,
@@ -1534,6 +1748,7 @@ class Oodle:
     def __init__(self):
         self._library = None
         self._path: Path | None = None
+        self._decompress_lock = threading.RLock()
 
     @property
     def path(self) -> Path | None:
@@ -1570,8 +1785,8 @@ class Oodle:
         if not path.is_file():
             raise RepairError(
                 "Bundled Oodle runtime is missing: "
-                f"{path}. Re-extract the complete repair-tool archive; "
-                "the tool does not download Oodle at runtime."
+                f"{path}. Re-extract the complete repair-script archive; "
+                "the script does not download Oodle at runtime."
             )
 
         try:
@@ -1627,7 +1842,11 @@ class Oodle:
         return destination.raw, result
 
     def decompress(self, compressed: bytes | bytearray, expected_size: int) -> bytes:
-        raw, result = self._decompress_call(compressed, expected_size)
+        # CDN transfers may run concurrently, but keep the bundled native Oodle
+        # decoder serialized. Network I/O still overlaps while this avoids
+        # assuming undocumented thread-safety for one shared ctypes handle.
+        with self._decompress_lock:
+            raw, result = self._decompress_call(compressed, expected_size)
         if result != expected_size:
             raise RepairError(
                 f"Oodle decompression returned {result} bytes; expected {expected_size}."
@@ -1833,9 +2052,10 @@ def _manifest_header_version(header: bytes) -> int:
 
 def parse_manifest_header(header: bytes):
     # U44 Cache.bin/B.Cache manifest structure:
-    #   GUID[16], u32 version, then service/packed/stripped sections.
-    # Every entry stores path, 16-byte target hash and a packed u32 where the
-    # low 24 bits are size and the high 8 bits are flags.
+    #   embedded object hash[16], u32 version, then service/packed/stripped sections.
+    # Every entry stores path, 16-byte target hash and a packed u32. Real U43/U44
+    # CDN objects, including >16 MiB Packages.bin objects, establish that the low
+    # 28 bits are the exact CDN byte size. The high nibble is separate metadata.
     #
     # All 38 directly decompressed U44.0.1/U44.0.2 manifests use version 14.
     # Treat a different value as a compatibility boundary instead of attempting
@@ -1873,7 +2093,7 @@ def parse_manifest_header(header: bytes):
             offset += path_size
             manifest_hash = header[offset:offset + 16]
             offset += 16
-            # Packed size/flags metadata is not needed for repair selection.
+            info = struct.unpack_from("<I", header, offset)[0]
             offset += 4
 
             try:
@@ -1881,7 +2101,7 @@ def parse_manifest_header(header: bytes):
             except UnicodeDecodeError:
                 path = raw_path.decode("latin-1")
 
-            yield section, path, manifest_hash
+            yield section, path, manifest_hash, info
 
     trailing = header[offset:]
     if trailing:
@@ -1889,13 +2109,413 @@ def parse_manifest_header(header: bytes):
             f"Unexpected {len(trailing)} trailing {_plural(len(trailing), 'byte')} in cache manifest."
         )
 
+@dataclass(frozen=True, slots=True)
+class HCacheIndex:
+    version: int
+    entries: dict[str, bytes]
+
+@dataclass(frozen=True, slots=True)
+class ManifestCoverageResult:
+    manifests: list[tuple[Path, re.Match[str]]]
+    state: str
+    recovered: int = 0
+
+    @property
+    def verified(self) -> bool:
+        return self.state in {"verified-complete", "verified-recovered"}
+
+def parse_h_cache_header(header: bytes) -> HCacheIndex:
+    # H.Cache is the meta-manifest above the B.Cache families. Existing cache
+    # tooling uses the same fixed 20-byte prefix followed by one or more groups
+    # of path/hash records. Keep this parser structural rather than pinning its
+    # version so older target captures can still use H.Cache completion.
+    if len(header) < 20:
+        raise RepairError("H.Cache header is too short.")
+
+    version = struct.unpack_from("<I", header, 16)[0]
+    offset = 20
+    entries: dict[str, bytes] = {}
+
+    while offset < len(header):
+        if offset + 4 > len(header):
+            raise RepairError("Truncated H.Cache entry-group count.")
+        count = struct.unpack_from("<I", header, offset)[0]
+        offset += 4
+        if count > 5_000_000:
+            raise RepairError(f"Unreasonable H.Cache entry count: {count}.")
+
+        for _ in range(count):
+            if offset + 4 > len(header):
+                raise RepairError("Truncated H.Cache path length.")
+            path_size = struct.unpack_from("<I", header, offset)[0]
+            offset += 4
+            required = path_size + 20
+            if path_size <= 0 or offset + required > len(header):
+                raise RepairError("Truncated H.Cache entry.")
+
+            raw_path = header[offset:offset + path_size]
+            offset += path_size
+            target_hash = header[offset:offset + 16]
+            offset += 16
+            # The final u32 is metadata that is not needed for B.Cache recovery.
+            offset += 4
+
+            try:
+                logical_path = raw_path.decode("utf-8")
+            except UnicodeDecodeError:
+                logical_path = raw_path.decode("latin-1")
+            if logical_path in entries:
+                raise RepairError(f"Duplicate H.Cache entry: {logical_path}")
+            entries[logical_path] = target_hash
+
+    return HCacheIndex(version=version, entries=entries)
+
+def _h_cache_b_cache_entries(index: HCacheIndex) -> dict[tuple[str, str | None], tuple[str, bytes]]:
+    families: dict[tuple[str, str | None], tuple[str, bytes]] = {}
+    for logical_path, target_hash in index.entries.items():
+        match = H_CACHE_B_CACHE_RE.fullmatch(logical_path)
+        if match is None:
+            if logical_path.startswith("/B.Cache.") and logical_path.endswith(".bin"):
+                raise RepairError(f"Unsupported B.Cache family listed by H.Cache: {logical_path}")
+            continue
+        identity = (match.group("kind"), match.group("suffix"))
+        if identity in families:
+            raise RepairError(
+                "H.Cache contains multiple entries for the same B.Cache family: "
+                f"{families[identity][0]} and {logical_path}."
+            )
+        families[identity] = (logical_path, target_hash)
+    if not families:
+        raise RepairError("H.Cache does not contain any supported B.Cache manifest entries.")
+    return families
+
+def h_cache_files(content_root: Path) -> list[tuple[Path, int]]:
+    directory = content_root / "0"
+    if not directory.is_dir():
+        return []
+
+    found: list[tuple[Path, int]] = []
+    try:
+        children = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
+    except OSError as exc:
+        raise RepairError(f"Could not enumerate {directory}: {exc}") from exc
+
+    for path in children:
+        if not path.is_file():
+            continue
+        match = H_CACHE_FILE_RE.fullmatch(path.name)
+        if match is not None:
+            found.append((path, int(match.group("type"), 16)))
+    return found
+
+def _captured_manifest_metadata(
+    manifests: list[tuple[Path, re.Match[str]]],
+) -> tuple[set[int], dict[str, str]]:
+    types: set[int] = set()
+    hashes: dict[str, str] = {}
+    for manifest_path, match in manifests:
+        types.add(int(match.group("type"), 16))
+        logical_path = "/" + manifest_path.name.split("!", 1)[0]
+        hashes[logical_path] = match.group("hash")
+    return types, hashes
+
+def _h_cache_matches_captured(
+    index: HCacheIndex,
+    manifests: list[tuple[Path, re.Match[str]]],
+) -> tuple[bool, str, int]:
+    _types, captured = _captured_manifest_metadata(manifests)
+    if not captured:
+        return False, "no captured B.Cache manifests are available for comparison", 0
+
+    b_cache_entries = _h_cache_b_cache_entries(index)
+    by_path = {logical_path: target_hash for logical_path, target_hash in b_cache_entries.values()}
+    matched = 0
+    for logical_path, captured_hash in captured.items():
+        target_hash = by_path.get(logical_path)
+        if target_hash is None:
+            return False, f"{logical_path} is not listed by H.Cache", matched
+        h_cache_hash = b64m_encode(target_hash)
+        if h_cache_hash != captured_hash:
+            return (
+                False,
+                f"{logical_path} hash differs (captured {captured_hash}, H.Cache {h_cache_hash})",
+                matched,
+            )
+        matched += 1
+    return True, "", matched
+
+def _h_cache_filename(manifest_type: int) -> str:
+    return f"H.Cache.bin!{manifest_type:X}_{H_CACHE_SENTINEL_HASH}"
+
+def _h_cache_origin_url(manifest_type: int) -> str:
+    filename = urllib.parse.quote(_h_cache_filename(manifest_type), safe="!_-.,~")
+    return H_CACHE_ORIGIN_BASE + filename
+
+def _decode_h_cache_object(
+    data: bytes | bytearray,
+    oodle: Oodle,
+    *,
+    progress_name: str,
+) -> HCacheIndex:
+    header, embedded_hash = shcc_header_and_hash(data, oodle, progress_name=progress_name)
+    calculated_hash = hashlib.md5(SHCC_PREAMBLE + header[16:]).digest()
+    if embedded_hash != calculated_hash:
+        raise RepairError(
+            "H.Cache embedded object hash does not match its decoded header payload."
+        )
+    return parse_h_cache_header(header)
+
+def _download_official_h_cache(
+    manifest_type: int,
+    oodle: Oodle,
+) -> tuple[bytes | bytearray | None, HCacheIndex | None, str | None, int | None]:
+    filename = _h_cache_filename(manifest_type)
+    url = _h_cache_origin_url(manifest_type)
+    last_error: str | None = None
+    last_status: int | None = None
+
+    for attempt in range(1, HTTP_ATTEMPTS + 1):
+        try:
+            body, status = _curl_download_bytes(
+                url,
+                filename,
+                max_bytes=H_CACHE_MAX_RESPONSE_BYTES,
+            )
+            last_status = status
+            if status != 200:
+                last_error = f"HTTP {status}"
+                if status not in {408, 425, 429, 500, 502, 503, 504}:
+                    break
+            else:
+                try:
+                    index = _decode_h_cache_object(
+                        body,
+                        oodle,
+                        progress_name=filename,
+                    )
+                except RepairError as exc:
+                    last_error = f"verification failed: {_single_line_console_text(exc)}"
+                else:
+                    return body, index, None, 200
+        except OSError as exc:
+            last_status = None
+            last_error = _single_line_console_text(exc)
+
+        if attempt < HTTP_ATTEMPTS:
+            print_retry(attempt + 1, last_error or "unknown download error", filename)
+            time.sleep(0.5 * attempt)
+
+    return None, None, last_error or "unknown download error", last_status
+
+def _matching_h_cache_index(
+    content_root: Path,
+    manifests: list[tuple[Path, re.Match[str]]],
+    oodle: Oodle,
+) -> tuple[HCacheIndex, int] | None:
+    manifest_types, _captured = _captured_manifest_metadata(manifests)
+
+    if manifests:
+        if len(manifest_types) != 1:
+            print_warning(
+                "Captured B.Cache manifests do not use one unambiguous manifest type; "
+                "automatic H.Cache completion is skipped.",
+                prefix="[H.Cache]",
+            )
+            return None
+        manifest_type = next(iter(manifest_types))
+        filename = _h_cache_filename(manifest_type)
+        local = content_root / "0" / filename
+    else:
+        local_h_caches = h_cache_files(content_root)
+        if len(local_h_caches) != 1:
+            reason = (
+                "no captured H.Cache is available"
+                if not local_h_caches
+                else "multiple captured H.Cache manifest types are present"
+            )
+            print_warning(
+                f"No B.Cache manifests are available and {reason}; automatic manifest "
+                "bootstrap cannot establish a target build.",
+                prefix="[H.Cache]",
+            )
+            return None
+        local, manifest_type = local_h_caches[0]
+        filename = local.name
+
+    if local.is_file():
+        try:
+            local_size = local.stat().st_size
+            if local_size > H_CACHE_MAX_RESPONSE_BYTES:
+                raise RepairError(
+                    f"captured H.Cache exceeds safe size limit of "
+                    f"{_format_bytes(H_CACHE_MAX_RESPONSE_BYTES)} "
+                    f"({_format_bytes(local_size)})"
+                )
+            with local.open("rb") as stream:
+                local_data = stream.read(H_CACHE_MAX_RESPONSE_BYTES + 1)
+            if len(local_data) > H_CACHE_MAX_RESPONSE_BYTES:
+                raise RepairError(
+                    f"captured H.Cache exceeded safe size limit of "
+                    f"{_format_bytes(H_CACHE_MAX_RESPONSE_BYTES)} while reading"
+                )
+            index = _decode_h_cache_object(
+                local_data,
+                oodle,
+                progress_name=filename,
+            )
+        except (OSError, RepairError) as exc:
+            if not manifests:
+                print_warning(
+                    f"Captured {filename} is unusable: {_single_line_console_text(exc)}; "
+                    "without B.Cache overlap there is no safe target identity for an "
+                    "official fallback.",
+                    prefix="[H.Cache]",
+                )
+                return None
+            print_warning(
+                f"Captured {filename} is unusable: {_single_line_console_text(exc)}; "
+                "trying the official DE copy.",
+                prefix="[H.Cache]",
+            )
+        else:
+            if not manifests:
+                print(
+                    f"[H.Cache] Captured {filename} accepted as the target meta-manifest; "
+                    "no B.Cache manifests were captured for overlap comparison."
+                )
+                return index, manifest_type
+
+            matches, reason, matched = _h_cache_matches_captured(index, manifests)
+            if matches:
+                print(
+                    f"[H.Cache] Captured metadata matches {matched}/{len(manifests)} "
+                    "captured B.Cache manifests."
+                )
+                return index, manifest_type
+            print_warning(
+                f"Captured {filename} does not match this target: {reason}; "
+                "trying the official DE copy.",
+                prefix="[H.Cache]",
+            )
+
+    if not manifests:
+        return None
+
+    body, index, error, http_status = _download_official_h_cache(manifest_type, oodle)
+    if body is None or index is None:
+        http = f"HTTP {http_status}: " if http_status is not None else ""
+        print_warning(
+            f"Could not obtain official {filename}; automatic B.Cache completion is unavailable: "
+            f"{http}{_single_line_console_text(error or 'unknown error')}",
+            prefix="[H.Cache]",
+        )
+        return None
+
+    matches, reason, matched = _h_cache_matches_captured(index, manifests)
+    if not matches:
+        print_warning(
+            "Official H.Cache does not match the captured target; refusing to mix B.Cache "
+            f"manifests from different builds: {reason}",
+            prefix="[H.Cache]",
+        )
+        return None
+
+    try:
+        atomic_write(local, body, progress_label="Saving", display_name=filename)
+    except (OSError, RepairError) as exc:
+        raise RepairError(f"Could not save verified {filename}: {exc}") from exc
+
+    print(
+        f"[H.Cache] Official metadata matches {matched}/{len(manifests)} captured "
+        "B.Cache manifests."
+    )
+    return index, manifest_type
+
+def complete_target_manifests_from_h_cache(
+    content_root: Path,
+    manifests: list[tuple[Path, re.Match[str]]],
+    oodle: Oodle,
+) -> ManifestCoverageResult:
+    matched = _matching_h_cache_index(content_root, manifests, oodle)
+    if matched is None:
+        print_warning(
+            "Manifest coverage is unverified; repair can continue best-effort but cannot "
+            "be reported as complete.",
+            prefix="[H.Cache]",
+        )
+        return ManifestCoverageResult(manifests=manifests, state="unverified")
+
+    index, manifest_type = matched
+    expected_families = _h_cache_b_cache_entries(index)
+    _types, captured_hashes = _captured_manifest_metadata(manifests)
+    missing = [
+        (logical_path, target_hash)
+        for logical_path, target_hash in expected_families.values()
+        if logical_path not in captured_hashes
+    ]
+    missing.sort(key=lambda item: item[0].casefold())
+
+    main_hash = index.entries.get("/B.Cache.Windows.bin")
+    if main_hash is not None:
+        print(f"[H.Cache] Cache manifest hash: {b64m_encode(main_hash)}")
+    print(
+        f"[H.Cache] B.Cache coverage: {len(manifests)}/{len(expected_families)} present"
+        + (f" | recovering {len(missing)} missing" if missing else " | complete")
+    )
+
+    for logical_path, target_hash in missing:
+        expected_hash = b64m_encode(target_hash)
+        name = cache_name(logical_path, manifest_type, expected_hash, "0")
+        status, detail, http_status = repair_object(
+            content_root=content_root,
+            name=name,
+            expected_hash=expected_hash,
+            oodle=oodle,
+            label="Manifest",
+        )
+        if status in {"present", "downloaded", "repaired"}:
+            if status != "present":
+                action = "Repaired" if status == "repaired" else "Downloaded"
+                print(
+                    f"{http_status_label(http_status or 200)} [H.Cache {action}] {name} | "
+                    f"{_single_line_console_text(detail or 'DE CDN')}"
+                )
+            continue
+        raise RepairError(
+            f"Could not recover target manifest {name}: "
+            f"{_single_line_console_text(detail or 'unknown error')}"
+        )
+
+    completed = manifest_files(content_root)
+    completed_paths = {"/" + path.name.split("!", 1)[0] for path, _match in completed}
+    expected_paths = {logical_path for logical_path, _hash in expected_families.values()}
+    if completed_paths != expected_paths:
+        missing_after = sorted(expected_paths - completed_paths)
+        extra_after = sorted(completed_paths - expected_paths)
+        detail: list[str] = []
+        if missing_after:
+            detail.append("missing " + ", ".join(missing_after))
+        if extra_after:
+            detail.append("unexpected " + ", ".join(extra_after))
+        raise RepairError(
+            "B.Cache manifest coverage still differs from verified H.Cache metadata: "
+            + " | ".join(detail)
+        )
+
+    state = "verified-recovered" if missing else "verified-complete"
+    if missing:
+        print(f"[H.Cache] Manifest coverage: verified + recovered ({len(missing)} missing restored).")
+    else:
+        print("[H.Cache] Manifest coverage: verified + complete.")
+    return ManifestCoverageResult(manifests=completed, state=state, recovered=len(missing))
+
 def manifest_files(content_root: Path) -> list[tuple[Path, re.Match[str]]]:
     directory = content_root / "0"
     if not directory.is_dir():
         return []
 
     found: list[tuple[Path, re.Match[str]]] = []
-    identities: dict[tuple[str, str], Path] = {}
+    identities: dict[tuple[str, str | None], Path] = {}
     try:
         children = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
     except OSError as exc:
@@ -1921,6 +2541,32 @@ def manifest_files(content_root: Path) -> list[tuple[Path, re.Match[str]]]:
         found.append((path, match))
     return found
 
+def _stage_manifest_evidence(content_root: Path) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    staging = tempfile.TemporaryDirectory(prefix="warframe_patch_repair_manifests_")
+    staged_root = Path(staging.name)
+    source_directory = content_root / "0"
+    staged_directory = staged_root / "0"
+    staged_directory.mkdir(parents=True, exist_ok=True)
+
+    if source_directory.is_dir():
+        try:
+            children = sorted(source_directory.iterdir(), key=lambda p: p.name.casefold())
+        except OSError as exc:
+            staging.cleanup()
+            raise RepairError(f"Could not enumerate {source_directory}: {exc}") from exc
+        try:
+            for path in children:
+                if not path.is_file():
+                    continue
+                if MANIFEST_RE.fullmatch(path.name) is None and H_CACHE_FILE_RE.fullmatch(path.name) is None:
+                    continue
+                shutil.copy2(path, staged_directory / path.name)
+        except OSError as exc:
+            staging.cleanup()
+            raise RepairError(f"Could not stage manifest evidence from {source_directory}: {exc}") from exc
+
+    return staging, staged_root
+
 def resolve_content_root(target_root: Path) -> Path:
     candidates = (
         target_root / "OpenWF" / "Content",
@@ -1933,39 +2579,148 @@ def resolve_content_root(target_root: Path) -> Path:
         if manifest_files(candidate):
             return candidate
 
+    for candidate in candidates:
+        if h_cache_files(candidate):
+            return candidate
+
     expected = target_root / "OpenWF" / "Content" / "0"
     raise RepairError(
-        "Could not find any B.Cache manifest objects in a supported patch layout. "
+        "Could not find any B.Cache manifest objects or captured H.Cache metadata in a "
+        "supported patch layout. "
         f"Expected them below something like: {expected}"
     )
 
-def _read_response_with_progress(response, display_name: str) -> bytearray:
-    expected_header = response.headers.get("Content-Length")
-    expected_size: int | None = None
-    if expected_header is not None:
-        try:
-            expected_size = int(expected_header)
-        except ValueError:
-            expected_size = None
+def _require_pycurl():
+    if _pycurl is None:
+        raise RepairError(
+            "PyCURL/libcurl is required for network downloads. Install the bundled "
+            "requirements first: py -m pip install -r requirements.txt"
+        )
+    return _pycurl
 
-    progress = DownloadProgress(display_name, expected_size)
+def _curl_for_thread():
+    pycurl = _require_pycurl()
+    handle = getattr(_CURL_LOCAL, "handle", None)
+    if handle is None:
+        handle = pycurl.Curl()
+        _CURL_LOCAL.handle = handle
+    return handle
+
+def _curl_error_text(exc: BaseException) -> str:
+    if len(getattr(exc, "args", ())) >= 2:
+        return _single_line_console_text(exc.args[1])
+    return _single_line_console_text(exc)
+
+def _curl_download_bytes(
+    url: str,
+    display_name: str,
+    *,
+    max_bytes: int | None = None,
+    overall_progress: OverallDownloadProgress | None = None,
+    planned_size: int | None = None,
+) -> tuple[bytearray, int]:
+    pycurl = _require_pycurl()
+    curl = _curl_for_thread()
+    curl.reset()
+
     body = bytearray()
-    try:
-        while True:
-            chunk = response.read(256 * 1024)
-            if not chunk:
-                break
-            body.extend(chunk)
-            progress.update(len(chunk))
-        progress.update(0, force=True)
-    finally:
-        progress.finish()
+    response_status: int | None = None
+    expected_size: int | None = None
+    callback_error: OSError | None = None
+    progress: DownloadProgress | None = None
+    if overall_progress is not None:
+        overall_progress.start_attempt(display_name, planned_size)
 
-    if expected_size is not None and len(body) != expected_size:
+    def header_callback(raw: bytes) -> int:
+        nonlocal response_status, expected_size, callback_error
+        line = raw.strip()
+        status_match = _HTTP_STATUS_LINE_RE.match(line)
+        if status_match is not None:
+            response_status = int(status_match.group(1))
+            expected_size = None
+            return len(raw)
+
+        if b":" in line:
+            name, value = line.split(b":", 1)
+            if name.strip().lower() == b"content-length":
+                try:
+                    candidate = int(value.strip())
+                except ValueError:
+                    candidate = None
+                if candidate is not None and candidate >= 0:
+                    expected_size = candidate
+                    if (
+                        response_status == 200
+                        and max_bytes is not None
+                        and expected_size > max_bytes
+                    ):
+                        callback_error = OSError(
+                            f"response exceeds safe size limit of {_format_bytes(max_bytes)} "
+                            f"(Content-Length: {_format_bytes(expected_size)})"
+                        )
+                        return 0
+        return len(raw)
+
+    def write_callback(chunk: bytes) -> int:
+        nonlocal progress, callback_error
+        # Redirect/error response bodies are irrelevant to object verification and
+        # must not distort aggregate CDN progress.
+        if response_status != 200:
+            return len(chunk)
+
+        if max_bytes is not None and len(body) + len(chunk) > max_bytes:
+            callback_error = OSError(
+                f"response exceeded safe size limit of {_format_bytes(max_bytes)}"
+            )
+            return 0
+
+        if progress is None and overall_progress is None:
+            progress = DownloadProgress(display_name, expected_size)
+        body.extend(chunk)
+        if overall_progress is not None:
+            overall_progress.update(len(chunk))
+        else:
+            assert progress is not None
+            progress.update(len(chunk))
+        return len(chunk)
+
+    curl.setopt(pycurl.URL, url)
+    curl.setopt(pycurl.HTTPGET, 1)
+    curl.setopt(pycurl.USERAGENT, USER_AGENT)
+    curl.setopt(pycurl.HTTPHEADER, ["Accept: */*"])
+    curl.setopt(pycurl.FOLLOWLOCATION, 1)
+    curl.setopt(pycurl.MAXREDIRS, HTTP_MAX_REDIRECTS)
+    curl.setopt(pycurl.CONNECTTIMEOUT, HTTP_TIMEOUT)
+    curl.setopt(pycurl.LOW_SPEED_LIMIT, 1)
+    curl.setopt(pycurl.LOW_SPEED_TIME, HTTP_TIMEOUT)
+    curl.setopt(pycurl.NOSIGNAL, 1)
+    curl.setopt(pycurl.SSL_VERIFYPEER, 1)
+    curl.setopt(pycurl.SSL_VERIFYHOST, 2)
+    curl.setopt(pycurl.HEADERFUNCTION, header_callback)
+    curl.setopt(pycurl.WRITEFUNCTION, write_callback)
+
+    try:
+        curl.perform()
+    except pycurl.error as exc:
+        if callback_error is not None:
+            raise callback_error from exc
+        raise OSError(f"libcurl: {_curl_error_text(exc)}") from exc
+    finally:
+        if overall_progress is not None:
+            overall_progress.update(0, force=True)
+        elif progress is not None:
+            progress.update(0, force=True)
+            progress.finish()
+
+    if callback_error is not None:
+        raise callback_error
+
+    status = int(curl.getinfo(pycurl.RESPONSE_CODE) or response_status or 0)
+    if status == 200 and expected_size is not None and len(body) != expected_size:
         raise OSError(
             f"incomplete response: expected {expected_size} bytes, received {len(body)}"
         )
-    return body
+    return body, status
 
 def download_asset(
     url: str,
@@ -1973,55 +2728,80 @@ def download_asset(
     display_name: str,
     expected_hash: str,
     oodle: Oodle,
+    expected_size: int | None = None,
+    overall_progress: OverallDownloadProgress | None = None,
 ) -> tuple[bytes | bytearray | None, str | None, int | None]:
     last_error: str | None = None
     last_status: int | None = None
 
     for attempt in range(1, HTTP_ATTEMPTS + 1):
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "*/*",
-                "Connection": "close",
-            },
-        )
         try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-                status = int(getattr(response, "status", 0) or 0)
-                last_status = status
-                if status != 200:
-                    last_error = f"HTTP {status}"
-                    if status not in {408, 425, 429, 500, 502, 503, 504}:
-                        break
+            body, status = _curl_download_bytes(
+                url,
+                display_name,
+                overall_progress=overall_progress,
+                planned_size=expected_size,
+            )
+            last_status = status
+            if status != 200:
+                if overall_progress is not None:
+                    overall_progress.rollback_attempt()
+                last_error = f"HTTP {status}"
+                if status not in {408, 425, 429, 500, 502, 503, 504}:
+                    break
+            else:
+                try:
+                    validate_shcc(
+                        body,
+                        expected_hash,
+                        oodle,
+                        progress_name=(
+                            display_name if overall_progress is None else None
+                        ),
+                    )
+                except RepairError as exc:
+                    if overall_progress is not None:
+                        overall_progress.rollback_attempt()
+                    last_error = f"verification failed: {_single_line_console_text(exc)}"
                 else:
-                    body = _read_response_with_progress(response, display_name)
-                    try:
-                        validate_shcc(
-                            body,
-                            expected_hash,
-                            oodle,
-                            progress_name=display_name,
-                        )
-                    except RepairError as exc:
-                        last_error = f"verification failed: {_single_line_console_text(exc)}"
-                    else:
-                        return body, None, 200
-                    # A successful HTTP response can still be truncated/corrupted in a
-                    # way Content-Length does not expose. Retry the exact object before
-                    # declaring repair failure.
+                    size_mismatch = (
+                        expected_size is not None and len(body) != expected_size
+                    )
+                    if overall_progress is not None:
+                        overall_progress.commit_attempt(len(body))
+                    if size_mismatch:
+                        if overall_progress is not None:
+                            with overall_progress.message_scope():
+                                print_warning(
+                                    f"Manifest CDN size for {display_name} was "
+                                    f"{_format_bytes(expected_size or 0)}, but the verified response was "
+                                    f"{_format_bytes(len(body))}; the running total was adjusted.",
+                                    prefix="[Download]",
+                                )
+                        else:
+                            print_warning(
+                                f"Manifest CDN size for {display_name} was "
+                                f"{_format_bytes(expected_size or 0)}, but the verified response was "
+                                f"{_format_bytes(len(body))}; the running total was adjusted.",
+                                prefix="[Download]",
+                            )
+                    return body, None, 200
+                # A successful HTTP response can still be truncated/corrupted in a
+                # way Content-Length does not expose. Retry the exact object before
+                # declaring repair failure.
 
-        except urllib.error.HTTPError as exc:
-            last_status = exc.code
-            last_error = f"HTTP {exc.code}"
-            if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
-                break
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except OSError as exc:
+            if overall_progress is not None:
+                overall_progress.rollback_attempt()
             last_status = None
             last_error = _single_line_console_text(exc)
 
         if attempt < HTTP_ATTEMPTS:
-            print_retry(attempt + 1, last_error or "unknown download error", display_name)
+            if overall_progress is not None:
+                with overall_progress.message_scope():
+                    print_retry(attempt + 1, last_error or "unknown download error", display_name)
+            else:
+                print_retry(attempt + 1, last_error or "unknown download error", display_name)
             time.sleep(0.5 * attempt)
 
     return None, last_error or "unknown download error", last_status
@@ -2032,6 +2812,7 @@ def atomic_write(
     *,
     progress_label: str = "Saving",
     display_name: str | None = None,
+    show_progress: bool = True,
 ) -> None:
     display = display_name or path.name
     _validate_windows_output_path(path, label="Output asset path")
@@ -2076,13 +2857,14 @@ def atomic_write(
                     pass
                 temporary = None
                 raise
-            progress = DownloadProgress(
-                display,
-                len(data),
-                label=progress_label,
-                # Do not flash a transient row for tiny writes that complete immediately.
-                show_after=0.15,
-            )
+            if show_progress:
+                progress = DownloadProgress(
+                    display,
+                    len(data),
+                    label=progress_label,
+                    # Do not flash a transient row for tiny writes that complete immediately.
+                    show_after=0.15,
+                )
             try:
                 with os.fdopen(fd, "wb") as handle:
                     view = memoryview(data)
@@ -2093,7 +2875,8 @@ def atomic_write(
                             raise OSError(
                                 f"short write: expected {len(chunk)} bytes, wrote {written}"
                             )
-                        progress.update(written)
+                        if progress is not None:
+                            progress.update(written)
             except BaseException:
                 # os.fdopen owns the descriptor once entered; if construction or
                 # the write failed before that point, close the raw descriptor too.
@@ -2103,7 +2886,8 @@ def atomic_write(
                     pass
                 raise
 
-            progress.update(0, force=True)
+            if progress is not None:
+                progress.update(0, force=True)
 
             while True:
                 try:
@@ -2159,10 +2943,19 @@ class ManifestAsset:
     section: str
     logical_path: str
     manifest_hash: bytes
+    info: int
 
     @property
     def hash_b64(self) -> str:
         return b64m_encode(self.manifest_hash)
+
+    @property
+    def cdn_size(self) -> int:
+        return self.info & MANIFEST_INFO_SIZE_MASK
+
+    @property
+    def cache_flags(self) -> int:
+        return self.info >> MANIFEST_INFO_FLAGS_SHIFT
 
 def _decode_toc_name(raw: bytes) -> str:
     raw = raw.split(b"\0", 1)[0]
@@ -2428,6 +3221,12 @@ def _make_crc32c_table() -> tuple[int, ...]:
 
 CRC32C_TABLE = _make_crc32c_table()
 
+def _native_crc32c_available() -> bool:
+    return (
+        _google_crc32c is not None
+        and getattr(_google_crc32c, "implementation", None) == "c"
+    )
+
 def crc32c(
     data: bytes | bytearray,
     *,
@@ -2445,18 +3244,27 @@ def crc32c(
         if progress_name is not None and limit >= VERIFY_PROGRESS_MIN_BYTES
         else None
     )
-    crc = 0xFFFFFFFF
     try:
+        if _native_crc32c_available():
+            checksum = _google_crc32c.Checksum()
+            for start in range(0, limit, 1024 * 1024):
+                stop = min(limit, start + 1024 * 1024)
+                checksum.update(bytes(memoryview(data)[start:stop]))
+                if progress is not None:
+                    progress.update(stop - start)
+            return int.from_bytes(checksum.digest(), "big")
+
+        crc = 0xFFFFFFFF
         for start in range(0, limit, 1024 * 1024):
             stop = min(limit, start + 1024 * 1024)
             for byte in data[start:stop]:
                 crc = CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
             if progress is not None:
                 progress.update(stop - start)
+        return (~crc) & 0xFFFFFFFF
     finally:
         if progress is not None:
             progress.finish()
-    return (~crc) & 0xFFFFFFFF
 
 def _cache_namespace_from_package(package: str) -> str:
     lower = package.casefold()
@@ -2468,6 +3276,26 @@ def _cache_namespace_from_package(package: str) -> str:
     if language is not None:
         return "0" + language.group(1)
     return "0"
+
+def _base_h_toc_files(cache_dir: Path) -> list[Path]:
+    try:
+        return sorted(
+            (
+                path
+                for path in cache_dir.glob("H.*.toc")
+                if (
+                    path.is_file()
+                    and path.name.startswith("H.")
+                    and path.name.casefold().endswith(".toc")
+                    and path.name[2:-4]
+                )
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError as exc:
+        raise RepairError(
+            f"Could not enumerate base H TOCs in {cache_dir}: {exc}"
+        ) from exc
 
 class BaseHeaderCache:
     def __init__(
@@ -2487,19 +3315,10 @@ class BaseHeaderCache:
             self._scan(target_keys)
 
     def _scan(self, target_keys: set[tuple[str, str]]) -> None:
-        try:
-            toc_files = sorted(
-                self.cache_dir.glob("H.*.toc"),
-                key=lambda path: path.name.casefold(),
-            )
-        except OSError as exc:
-            raise RepairError(
-                f"Could not enumerate base H TOCs in {self.cache_dir}: {exc}"
-            ) from exc
-
+        toc_files = _base_h_toc_files(self.cache_dir)
         if not toc_files:
             raise RepairError(
-                f"Base Cache.Windows contains no H.*.toc files: {self.cache_dir}"
+                f"Base Cache.Windows contains no usable H.<package>.toc files: {self.cache_dir}"
             )
 
         target_namespaces = {namespace for namespace, _logical_path in target_keys}
@@ -2508,11 +3327,7 @@ class BaseHeaderCache:
         matched_entries = 0
         try:
             for toc_index, toc_path in enumerate(toc_files, 1):
-                if not toc_path.name.startswith("H.") or not toc_path.name.casefold().endswith(".toc"):
-                    continue
                 package = toc_path.name[2:-4]
-                if not package:
-                    continue
                 namespace = _cache_namespace_from_package(package)
                 if namespace not in target_namespaces:
                     continue
@@ -2606,6 +3421,8 @@ def repair_object(
     expected_hash: str,
     oodle: Oodle,
     label: str,
+    expected_size: int | None = None,
+    overall_progress: OverallDownloadProgress | None = None,
 ) -> tuple[str, str | None, int | None]:
     try:
         destination = local_path(content_root, name)
@@ -2617,7 +3434,12 @@ def repair_object(
         try:
             existing = destination.read_bytes()
         except OSError as exc:
-            print(f"[{label} check failed] {name} | {_single_line_console_text(exc)}")
+            message = f"[{label} check failed] {name} | {_single_line_console_text(exc)}"
+            if overall_progress is not None:
+                with overall_progress.message_scope():
+                    print(message)
+            else:
+                print(message)
         else:
             try:
                 validate_shcc(
@@ -2627,10 +3449,15 @@ def repair_object(
                     progress_name=name,
                 )
             except RepairError as exc:
-                print(
+                message = (
                     f"[{label} repairing] Existing asset is invalid: {name} | "
                     f"{_single_line_console_text(exc)}"
                 )
+                if overall_progress is not None:
+                    with overall_progress.message_scope():
+                        print(message)
+                else:
+                    print(message)
             else:
                 return "present", None, None
 
@@ -2640,11 +3467,19 @@ def repair_object(
         display_name=name,
         expected_hash=expected_hash,
         oodle=oodle,
+        expected_size=expected_size,
+        overall_progress=overall_progress,
     )
 
     if body is not None:
         try:
-            atomic_write(destination, body, progress_label="Saving", display_name=name)
+            atomic_write(
+                destination,
+                body,
+                progress_label="Saving",
+                display_name=name,
+                show_progress=overall_progress is None,
+            )
         except (OSError, RepairError) as exc:
             return "failed", f"could not save downloaded asset: {_single_line_console_text(exc)}", http_status
         return ("repaired" if existed else "downloaded"), "CDN", http_status
@@ -3115,7 +3950,7 @@ def collect_manifest_assets(
         progress = ActivityProgress("Parsing manifest")
         try:
             manifest_version = _manifest_header_version(header)
-            for section, asset_path, manifest_hash in parse_manifest_header(header):
+            for section, asset_path, manifest_hash, info in parse_manifest_header(header):
                 section_counts[section] += 1
                 parsed_assets.append(
                     ManifestAsset(
@@ -3123,6 +3958,7 @@ def collect_manifest_assets(
                         section=section,
                         logical_path=asset_path,
                         manifest_hash=manifest_hash,
+                        info=info,
                     )
                 )
                 count = len(parsed_assets)
@@ -3205,6 +4041,28 @@ def resolve_manifest_asset_type(
 
     return None, None
 
+def _resolve_manifest_asset_type_with_fallbacks(
+    asset: ManifestAsset,
+    *,
+    resolver: TypeResolver,
+    base_type_hint: int | None = None,
+    base_group_type_hint: int | None = None,
+    openwf_type_hint: int | None = None,
+) -> tuple[int | None, str | None]:
+    type_id, source = resolve_manifest_asset_type(asset, resolver=resolver)
+    if type_id is not None:
+        return type_id, source
+    if base_type_hint is not None:
+        return base_type_hint, "original base same-path CommonHeader type hint"
+    if base_group_type_hint is not None:
+        return (
+            base_group_type_hint,
+            "original base same-path namespace-group CommonHeader type hint",
+        )
+    if openwf_type_hint is not None:
+        return openwf_type_hint, "exact current-session OpenWF 404 fallback"
+    return None, None
+
 def classify_manifest_against_base(
     assets: list[ManifestAsset],
     base_cache: BaseHeaderCache,
@@ -3213,7 +4071,7 @@ def classify_manifest_against_base(
     unchanged = 0
     unknown = 0
     base_type_hints: dict[tuple[str, str], int] = {}
-    cached: dict[tuple[str, str, str], tuple[str, int | None]] = {}
+    cached: dict[ManifestAssetKey, tuple[str, int | None]] = {}
 
     progress = ActivityProgress("Comparing base", len(assets))
     try:
@@ -3282,20 +4140,32 @@ def repair_manifest_asset(
     resolver: TypeResolver,
     label: str,
     base_type_hint: int | None = None,
+    base_group_type_hint: int | None = None,
     openwf_type_hint: int | None = None,
-) -> tuple[str, str | None, str | None, int | None]:
+    overall_progress: OverallDownloadProgress | None = None,
+) -> ManifestRepairResult:
     exact_object = _existing_exact_object(resolver, asset)
     if exact_object is not None:
         try:
             existing = exact_object.path.read_bytes()
         except OSError as exc:
-            print(f"[{label} check failed] {exact_object.path} | {_single_line_console_text(exc)}")
+            message = (
+                f"[{label} check failed] {exact_object.path} | "
+                f"{_single_line_console_text(exc)}"
+            )
+            if overall_progress is not None:
+                with overall_progress.message_scope():
+                    print(message)
+            else:
+                print(message)
         else:
             if verify_shcc(
                 existing,
                 asset.hash_b64,
                 oodle,
-                progress_name=exact_object.path.name,
+                progress_name=(
+                    exact_object.path.name if overall_progress is None else None
+                ),
             ):
                 try:
                     existing_name = exact_object.path.relative_to(source_content_root).as_posix()
@@ -3328,16 +4198,13 @@ def repair_manifest_asset(
                     None,
                 )
 
-    type_id, source = resolve_manifest_asset_type(
+    type_id, source = _resolve_manifest_asset_type_with_fallbacks(
         asset,
         resolver=resolver,
+        base_type_hint=base_type_hint,
+        base_group_type_hint=base_group_type_hint,
+        openwf_type_hint=openwf_type_hint,
     )
-    if type_id is None and base_type_hint is not None:
-        type_id = base_type_hint
-        source = "original base same-path CommonHeader type hint"
-    if type_id is None and openwf_type_hint is not None:
-        type_id = openwf_type_hint
-        source = "exact current-session OpenWF 404 fallback"
 
     if type_id is None:
         return "skipped", "type unresolved", None, None
@@ -3354,12 +4221,245 @@ def repair_manifest_asset(
         expected_hash=asset.hash_b64,
         oodle=oodle,
         label=label,
+        expected_size=asset.cdn_size if overall_progress is not None else None,
+        overall_progress=overall_progress,
     )
     if detail is None:
         return status, source, name, http_status
     if source:
         return status, f"{detail}; type from {source}", name, http_status
     return status, detail, name, http_status
+
+def _manifest_asset_download_preflight(
+    asset: ManifestAsset,
+    *,
+    content_root: Path,
+    oodle: Oodle,
+    resolver: TypeResolver,
+    base_type_hint: int | None = None,
+    base_group_type_hint: int | None = None,
+    openwf_type_hint: int | None = None,
+) -> tuple[
+    bool,
+    ManifestRepairResult | None,
+]:
+    exact_object = _existing_exact_object(resolver, asset)
+    invalid_exact_path: Path | None = None
+    if exact_object is not None:
+        try:
+            existing = exact_object.path.read_bytes()
+        except OSError:
+            invalid_exact_path = exact_object.path
+        else:
+            if verify_shcc(existing, asset.hash_b64, oodle):
+                try:
+                    existing_name = exact_object.path.relative_to(content_root).as_posix()
+                except ValueError:
+                    # A valid source object outside this output tree still has to
+                    # be copied (notably --only-stripped), so let the normal repair
+                    # path perform that write instead of caching a final result.
+                    return False, None
+                try:
+                    destination = local_path(content_root, existing_name)
+                except RepairError as exc:
+                    return False, (
+                        "failed",
+                        _single_line_console_text(exc),
+                        existing_name,
+                        None,
+                    )
+                if destination == exact_object.path:
+                    return False, (
+                        "present",
+                        f"existing patch object 0x{exact_object.type_id:X}",
+                        existing_name,
+                        None,
+                    )
+                return False, None
+            invalid_exact_path = exact_object.path
+
+    type_id, source = _resolve_manifest_asset_type_with_fallbacks(
+        asset,
+        resolver=resolver,
+        base_type_hint=base_type_hint,
+        base_group_type_hint=base_group_type_hint,
+        openwf_type_hint=openwf_type_hint,
+    )
+    if type_id is None:
+        return False, ("skipped", "type unresolved", None, None)
+
+    name = cache_name(asset.logical_path, type_id, asset.hash_b64, asset.namespace)
+    try:
+        destination = local_path(content_root, name)
+    except RepairError as exc:
+        detail = _single_line_console_text(exc)
+        if source:
+            detail = f"{detail}; type from {source}"
+        return False, ("failed", detail, name, None)
+    if destination == invalid_exact_path:
+        return True, None
+    if not destination.is_file():
+        return True, None
+    try:
+        existing = destination.read_bytes()
+    except OSError:
+        return True, None
+    if verify_shcc(existing, asset.hash_b64, oodle):
+        return False, ("present", source, name, None)
+    return True, None
+
+def plan_manifest_downloads(
+    assets: list[ManifestAsset],
+    *,
+    content_root: Path,
+    oodle: Oodle,
+    resolver: TypeResolver,
+    base_type_hints: dict[tuple[str, str], int],
+    base_group_type_hints: dict[tuple[str, str], int],
+    openwf_hints: dict[ManifestAssetKey, int],
+    cached_results: dict[
+        ManifestAssetKey,
+        ManifestRepairResult,
+    ] | None = None,
+) -> tuple[list[ManifestAsset], int]:
+    planned: list[ManifestAsset] = []
+    total_bytes = 0
+    progress = ActivityProgress("Planning downloads", len(assets))
+    try:
+        for index, asset in enumerate(assets, 1):
+            asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
+            needs_download, cached_result = _manifest_asset_download_preflight(
+                asset,
+                content_root=content_root,
+                oodle=oodle,
+                resolver=resolver,
+                base_type_hint=base_type_hints.get(
+                    (asset.namespace, asset.logical_path)
+                ),
+                base_group_type_hint=base_group_type_hints.get(
+                    (_namespace_group(asset.namespace), asset.logical_path)
+                ),
+                openwf_type_hint=openwf_hints.get(asset_key),
+            )
+            if cached_result is not None and cached_results is not None:
+                cached_results[asset_key] = cached_result
+            if needs_download:
+                planned.append(asset)
+                total_bytes += asset.cdn_size
+            if index == 1 or index % 256 == 0 or index == len(assets):
+                progress.update(
+                    index,
+                    extra=f"CDN {len(planned)} | {_format_bytes(total_bytes)}",
+                )
+    finally:
+        progress.finish()
+    return planned, total_bytes
+
+def _manifest_result_message(
+    asset: ManifestAsset,
+    result: ManifestRepairResult,
+) -> str:
+    status, detail, resolved_name, http_status = result
+    display_name = resolved_name or (
+        f"{asset.namespace}{asset.logical_path}!<unresolved-type>_{asset.hash_b64}"
+    )
+    if status == "downloaded":
+        return (
+            f"{http_status_label(http_status or 200)} {display_name} | "
+            f"{_single_line_console_text(detail or 'CDN')}"
+        )
+    if status == "repaired":
+        return (
+            f"{http_status_label(http_status or 200)} [Repaired] {display_name} | "
+            f"{_single_line_console_text(detail or 'CDN')}"
+        )
+    if status == "copied":
+        return f"[Copied] {display_name} | {_single_line_console_text(detail or '')}"
+    if status == "present":
+        return f"[Present] {display_name}"
+    if status == "skipped":
+        return (
+            f"[Skipped] {asset.namespace}{asset.logical_path} | hash {asset.hash_b64} | "
+            f"{_single_line_console_text(detail or 'type unresolved')}"
+        )
+    http = (
+        f" {http_status_label(http_status)}"
+        if http_status is not None and http_status != 200
+        else ""
+    )
+    reason = (
+        ""
+        if http_status is not None and detail == f"HTTP {http_status}"
+        else f" | {_single_line_console_text(detail or 'unknown error')}"
+    )
+    return (
+        f"[Failed]{http} {asset.namespace}{asset.logical_path} "
+        f"| hash {asset.hash_b64}{reason}"
+    )
+
+def repair_planned_manifest_downloads(
+    assets: list[ManifestAsset],
+    *,
+    content_root: Path,
+    source_content_root: Path,
+    oodle: Oodle,
+    resolver: TypeResolver,
+    label: str,
+    base_type_hints: dict[tuple[str, str], int],
+    base_group_type_hints: dict[tuple[str, str], int],
+    openwf_hints: dict[ManifestAssetKey, int],
+    overall_progress: OverallDownloadProgress,
+    workers: int,
+) -> dict[ManifestAssetKey, ManifestRepairResult]:
+    def repair_one(asset: ManifestAsset):
+        asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
+        return asset_key, repair_manifest_asset(
+            asset,
+            content_root=content_root,
+            source_content_root=source_content_root,
+            oodle=oodle,
+            resolver=resolver,
+            label=label,
+            base_type_hint=base_type_hints.get(
+                (asset.namespace, asset.logical_path)
+            ),
+            base_group_type_hint=base_group_type_hints.get(
+                (_namespace_group(asset.namespace), asset.logical_path)
+            ),
+            openwf_type_hint=openwf_hints.get(asset_key),
+            overall_progress=overall_progress,
+        )
+
+    def report_finished(
+        asset: ManifestAsset,
+        result: ManifestRepairResult,
+    ) -> None:
+        with overall_progress.message_scope():
+            print(_manifest_result_message(asset, result), flush=True)
+
+    if workers <= 1 or len(assets) <= 1:
+        results = {}
+        for asset in assets:
+            asset_key, result = repair_one(asset)
+            results[asset_key] = result
+            report_finished(asset, result)
+        return results
+
+    results: dict[
+        ManifestAssetKey,
+        ManifestRepairResult,
+    ] = {}
+    with ThreadPoolExecutor(
+        max_workers=min(workers, len(assets)),
+        thread_name_prefix="WFPR-CDN",
+    ) as executor:
+        futures = {executor.submit(repair_one, asset): asset for asset in assets}
+        for future in as_completed(futures):
+            asset = futures[future]
+            asset_key, result = future.result()
+            results[asset_key] = result
+            report_finished(asset, result)
+    return results
 
 def prepare_openwf_404s(
     requested_log: Path,
@@ -3400,7 +4500,7 @@ def _select_manifest_sections(
         return [asset for asset in assets if asset.section == "stripped"]
     raise RepairError(f"Unknown manifest section mode: {section_mode}")
 
-def _manifest_object_keys(assets: list[ManifestAsset]) -> set[tuple[str, str, str]]:
+def _manifest_object_keys(assets: list[ManifestAsset]) -> set[ManifestAssetKey]:
     return {(asset.namespace, asset.logical_path, asset.hash_b64) for asset in assets}
 
 def _filter_openwf_by_section(
@@ -3430,9 +4530,9 @@ def _filter_openwf_by_section(
             omitted += 1
     return kept, omitted
 
-def _openwf_type_hints(objects: list[str]) -> dict[tuple[str, str, str], int]:
-    hints: dict[tuple[str, str, str], int] = {}
-    ambiguous: set[tuple[str, str, str]] = set()
+def _openwf_type_hints(objects: list[str]) -> dict[ManifestAssetKey, int]:
+    hints: dict[ManifestAssetKey, int] = {}
+    ambiguous: set[ManifestAssetKey] = set()
     for request_path in objects:
         match = CDN_OBJECT_RE.fullmatch(request_path)
         if match is None:
@@ -3454,7 +4554,7 @@ def _openwf_type_hints(objects: list[str]) -> dict[tuple[str, str, str], int]:
 
 def _strip_manifest_404s(
     objects: list[str],
-    manifest_keys: set[tuple[str, str, str]],
+    manifest_keys: set[ManifestAssetKey],
 ) -> list[str]:
     remaining: list[str] = []
     for request_path in objects:
@@ -3529,15 +4629,55 @@ def run(
     openwf_log: Path | None = None,
     section_mode: str = "all",
     stripped_output: Path | None = None,
+    download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
 ) -> int:
+    if section_mode not in {"all", "no-stripped", "only-stripped"}:
+        raise RepairError(f"Unknown manifest section mode: {section_mode}")
+    if patch_types_only and base_root is not None:
+        raise RepairError("Base path cannot be combined with patch-types-only mode.")
+    if patch_types_only and section_mode != "all":
+        raise RepairError("Manifest section filters cannot be combined with patch-types-only mode.")
+    if not patch_types_only and base_root is None:
+        raise RepairError("Base path is required for repair.")
     if stripped_output is not None and section_mode != "only-stripped":
         raise RepairError("Custom stripped output requires only-stripped mode.")
+    if not 1 <= download_workers <= MAX_DOWNLOAD_WORKERS:
+        raise RepairError(
+            f"Download workers must be between 1 and {MAX_DOWNLOAD_WORKERS}."
+        )
     if not target_root.exists():
         raise RepairError(f"Target path does not exist: {target_root}")
     if not target_root.is_dir():
         raise RepairError(f"Target path is not a directory: {target_root}")
 
     target_root = target_root.resolve()
+    full_completion = base_root is not None
+    base_cache_dir: Path | None = None
+    if full_completion:
+        assert base_root is not None
+        if not base_root.exists() or not base_root.is_dir():
+            raise RepairError(f"Base path is not a directory: {base_root}")
+        base_root = base_root.resolve()
+        base_cache_dir = find_cache_windows_dir(base_root)
+        if base_cache_dir is None:
+            raise RepairError(
+                "The base path must point to the original, unupdated Steam base with a "
+                "Cache.Windows directory."
+            )
+        if not _base_h_toc_files(base_cache_dir):
+            raise RepairError(
+                f"Base Cache.Windows contains no usable H.<package>.toc files: {base_cache_dir}"
+            )
+
+    if openwf_log is None:
+        log_path, openwf_objects, ignored_historical, openwf_session_found = (
+            None, [], 0, False
+        )
+    else:
+        log_path, openwf_objects, ignored_historical, openwf_session_found = prepare_openwf_404s(
+            openwf_log
+        )
+
     if section_mode != "only-stripped":
         try:
             usage = shutil.disk_usage(target_root)
@@ -3550,10 +4690,27 @@ def run(
 
     print(f"Warframe/update-patch root: {target_root}")
     print(f"OpenWF Content: {content_root}")
-    print(f"Manifests: {len(manifests)}")
-    print()
 
-    manifest_assets_raw, manifest_failures = collect_manifest_assets(manifests, oodle)
+    manifest_staging: tempfile.TemporaryDirectory[str] | None = None
+    manifest_evidence_root = content_root
+    if section_mode == "only-stripped":
+        manifest_staging, manifest_evidence_root = _stage_manifest_evidence(content_root)
+        manifests = manifest_files(manifest_evidence_root)
+        print("[Sections] Manifest completion is staged temporarily; source patch metadata is not modified.")
+
+    try:
+        manifest_coverage = complete_target_manifests_from_h_cache(
+            manifest_evidence_root,
+            manifests,
+            oodle,
+        )
+        manifests = manifest_coverage.manifests
+        print(f"Manifests: {len(manifests)}")
+        print()
+        manifest_assets_raw, manifest_failures = collect_manifest_assets(manifests, oodle)
+    finally:
+        if manifest_staging is not None:
+            manifest_staging.cleanup()
     all_manifest_assets, all_duplicate_entries = _dedupe_manifest_assets(manifest_assets_raw)
     if section_mode == "all":
         manifest_assets = all_manifest_assets
@@ -3611,31 +4768,14 @@ def run(
         patch_types_only=patch_types_only,
     )
 
-    if openwf_log is None:
-        log_path, openwf_objects, ignored_historical, openwf_session_found = (
-            None, [], 0, False
-        )
-    else:
-        log_path, openwf_objects, ignored_historical, openwf_session_found = prepare_openwf_404s(
-            openwf_log
-        )
-
-    full_completion = base_root is not None
     base_type_hints: dict[tuple[str, str], int] = {}
+    base_group_type_hints: dict[tuple[str, str], int] = {}
     unchanged_base = 0
     unknown_base = 0
 
     if full_completion:
         assert base_root is not None
-        if not base_root.exists() or not base_root.is_dir():
-            raise RepairError(f"Base path is not a directory: {base_root}")
-        base_root = base_root.resolve()
-        base_cache_dir = find_cache_windows_dir(base_root)
-        if base_cache_dir is None:
-            raise RepairError(
-                "The base path must point to the original, unupdated Steam base with a "
-                "Cache.Windows directory."
-            )
+        assert base_cache_dir is not None
 
         print()
         print("[Mode] Full update-patch completion.")
@@ -3665,6 +4805,7 @@ def run(
             unknown_base,
             base_type_hints,
         ) = classify_manifest_against_base(manifest_assets, base_cache)
+        base_group_type_hints = _group_namespace_type_hints(base_type_hints)
 
         changed_new_candidates = len(repair_assets)
         repair_keys = _manifest_object_keys(repair_assets)
@@ -3742,7 +4883,76 @@ def run(
     else:
         print(f"FontCache manifest candidates: {len(repair_assets)}")
 
-    manifest_parse_failures = manifest_failures
+    preflight_results: dict[
+        ManifestAssetKey,
+        ManifestRepairResult,
+    ] = {}
+    planned_download_assets, planned_download_bytes = plan_manifest_downloads(
+        repair_assets,
+        content_root=repair_content_root,
+        oodle=oodle,
+        resolver=type_resolver,
+        base_type_hints=base_type_hints,
+        base_group_type_hints=base_group_type_hints,
+        openwf_hints=openwf_hints,
+        cached_results=preflight_results,
+    )
+    planned_download_files = len(planned_download_assets)
+    planned_download_keys = _manifest_object_keys(planned_download_assets)
+    active_download_workers = min(download_workers, planned_download_files)
+    plan_suffix = (
+        f" | Workers: {active_download_workers}" if planned_download_files else ""
+    )
+    print(
+        f"[Plan] Asset CDN downloads: {planned_download_files} "
+        f"{_plural(planned_download_files, 'file')} | "
+        f"{_format_bytes(planned_download_bytes)}{plan_suffix}"
+    )
+    if openwf_objects:
+        print(
+            "[Plan] Direct OpenWF 404 fallback objects are outside the manifest-size total; "
+            "their sizes are known only if those fallback downloads are needed."
+        )
+
+    repair_label = (
+        "Stripped"
+        if section_mode == "only-stripped"
+        else "Completion" if full_completion else "FontCache"
+    )
+    planned_download_results: dict[
+        ManifestAssetKey,
+        ManifestRepairResult,
+    ] = dict(preflight_results)
+    if planned_download_files:
+        overall_download_progress = OverallDownloadProgress(
+            planned_download_bytes,
+            planned_download_files,
+        )
+        try:
+            downloaded_results = repair_planned_manifest_downloads(
+                planned_download_assets,
+                content_root=repair_content_root,
+                source_content_root=content_root,
+                oodle=oodle,
+                resolver=type_resolver,
+                label=repair_label,
+                base_type_hints=base_type_hints,
+                base_group_type_hints=base_group_type_hints,
+                openwf_hints=openwf_hints,
+                overall_progress=overall_download_progress,
+                workers=download_workers,
+            )
+            planned_download_results.update(downloaded_results)
+        finally:
+            overall_download_progress.finish()
+        print(
+            f"[Download] Completed asset CDN data: "
+            f"{_format_bytes(overall_download_progress.completed)} / "
+            f"{_format_bytes(overall_download_progress.total)} | "
+            f"{overall_download_progress.files_completed}/"
+            f"{overall_download_progress.files_total} files"
+        )
+
     manifest_present = 0
     manifest_copied = 0
     manifest_downloaded = 0
@@ -3767,22 +4977,24 @@ def run(
             )
 
         asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
-        status, detail, resolved_name, http_status = repair_manifest_asset(
-            asset,
-            content_root=repair_content_root,
-            source_content_root=content_root,
-            oodle=oodle,
-            resolver=type_resolver,
-            label="Stripped" if section_mode == "only-stripped" else "Completion" if full_completion else "FontCache",
-            base_type_hint=base_type_hints.get((asset.namespace, asset.logical_path)),
-            openwf_type_hint=openwf_hints.get(asset_key),
-        )
+        result = planned_download_results.get(asset_key)
+        if result is None:
+            result = repair_manifest_asset(
+                asset,
+                content_root=repair_content_root,
+                source_content_root=content_root,
+                oodle=oodle,
+                resolver=type_resolver,
+                label=repair_label,
+                base_type_hint=base_type_hints.get((asset.namespace, asset.logical_path)),
+                base_group_type_hint=base_group_type_hints.get(
+                    (_namespace_group(asset.namespace), asset.logical_path)
+                ),
+                openwf_type_hint=openwf_hints.get(asset_key),
+            )
+        status, detail, _resolved_name, _http_status = result
         if detail and "exact current-session OpenWF 404 fallback" in detail:
             manifest_404_hint_count += 1
-
-        display_name = resolved_name or (
-            f"{asset.namespace}{asset.logical_path}!<unresolved-type>_{asset.hash_b64}"
-        )
 
         if status == "present":
             manifest_present += 1
@@ -3790,31 +5002,21 @@ def run(
         elif status == "copied":
             manifest_copied += 1
             manifest_section_results[asset.section]["copied"] += 1
-            print(f"[Copied] {display_name} | {_single_line_console_text(detail)}", flush=True)
         elif status == "downloaded":
             manifest_downloaded += 1
             manifest_section_results[asset.section]["downloaded"] += 1
-            print(f"{http_status_label(200)} {display_name} | {_single_line_console_text(detail)}", flush=True)
         elif status == "repaired":
             manifest_repaired += 1
             manifest_section_results[asset.section]["repaired"] += 1
-            print(f"{http_status_label(http_status or 200)} [Repaired] {display_name} | {_single_line_console_text(detail)}", flush=True)
         elif status == "skipped":
             manifest_skipped += 1
             manifest_section_results[asset.section]["skipped"] += 1
-            print(
-                f"[Skipped] {asset.namespace}{asset.logical_path} "
-                f"| hash {asset.hash_b64} | {_single_line_console_text(detail)}"
-            )
         else:
             manifest_failed += 1
             manifest_section_results[asset.section]["failed"] += 1
-            http = f" {http_status_label(http_status)}" if http_status is not None and http_status != 200 else ""
-            reason = "" if http_status is not None and detail == f"HTTP {http_status}" else f" | {_single_line_console_text(detail)}"
-            print(
-                f"[Failed]{http} {asset.namespace}{asset.logical_path} "
-                f"| hash {asset.hash_b64}{reason}"
-            )
+
+        if status != "present" and asset_key not in planned_download_keys:
+            print(_manifest_result_message(asset, result), flush=True)
 
     openwf_objects = _strip_manifest_404s(
         openwf_objects, repair_asset_keys
@@ -3922,7 +5124,13 @@ def run(
             f"Skipped: {counts.get('skipped', 0)}"
         )
 
-    print(f"Manifest parse failures: {manifest_parse_failures}")
+    print(f"Manifest parse failures: {manifest_failures}")
+    coverage_label = {
+        "verified-complete": "Verified + complete",
+        "verified-recovered": f"Verified + recovered ({manifest_coverage.recovered} restored)",
+        "unverified": "Unverified",
+    }.get(manifest_coverage.state, manifest_coverage.state)
+    print(f"Manifest coverage: {coverage_label}")
     if full_completion:
         print(
             "Base comparison: "
@@ -3940,24 +5148,19 @@ def run(
             f"Failed: {openwf_failed}"
         )
 
-    if not full_completion and manifest_skipped:
-        if patch_types_only:
-            print(
-                "NOTE: Some FontCache entries could not be assigned a type in "
-                "--patch-types-only mode. The script tried patch-local evidence and the "
-                "matching Warframe.x64.exe; no original-base type hints are available "
-                "without the base positional path."
-            )
-        else:
-            print(
-                "NOTE: Some FontCache entries could not be assigned a type. The script "
-                "tried patch-local evidence, the matching Warframe.x64.exe, and base "
-                "Cache.Windows type hints."
-            )
+    if patch_types_only and manifest_skipped:
+        print(
+            "NOTE: Some FontCache entries could not be assigned a type in "
+            "--patch-types-only mode. The script tried patch-local evidence and the "
+            "matching Warframe.x64.exe; no original-base type hints are available "
+            "without the base positional path."
+        )
 
     incomplete_reasons: list[str] = []
-    if manifest_parse_failures:
-        incomplete_reasons.append(f"{manifest_parse_failures} manifest parse {_plural(manifest_parse_failures, 'failure')}")
+    if not manifest_coverage.verified:
+        incomplete_reasons.append("target B.Cache manifest coverage is unverified")
+    if manifest_failures:
+        incomplete_reasons.append(f"{manifest_failures} manifest parse {_plural(manifest_failures, 'failure')}")
     if manifest_failed:
         incomplete_reasons.append(f"{manifest_failed} manifest repair {_plural(manifest_failed, 'failure')}")
     if openwf_failed:
@@ -4053,6 +5256,18 @@ def main() -> int:
             "creating a timestamped folder in the current working directory"
         ),
     )
+    parser.add_argument(
+        "-w",
+        "--download-workers",
+        type=int,
+        default=DEFAULT_DOWNLOAD_WORKERS,
+        metavar="N",
+        help=(
+            "parallel manifest CDN asset downloads "
+            f"(1-{MAX_DOWNLOAD_WORKERS}; default: {DEFAULT_DOWNLOAD_WORKERS}; "
+            "1 disables parallel downloading)"
+        ),
+    )
 
     try:
         args = parser.parse_args()
@@ -4063,6 +5278,10 @@ def main() -> int:
             parser.error("manifest section filters cannot be combined with --patch-types-only")
         if args.stripped_output is not None and not args.only_stripped:
             parser.error("--stripped-output requires --only-stripped")
+        if not 1 <= args.download_workers <= MAX_DOWNLOAD_WORKERS:
+            parser.error(
+                f"-w/--download-workers must be between 1 and {MAX_DOWNLOAD_WORKERS}"
+            )
         if not args.patch_types_only and args.base is None:
             parser.error("base path is required for repair")
 
@@ -4081,6 +5300,7 @@ def main() -> int:
                 openwf_log=args.openwf_log,
                 section_mode=section_mode,
                 stripped_output=args.stripped_output,
+                download_workers=args.download_workers,
             )
     except KeyboardInterrupt:
         print_warning("Interrupted by user.", file=sys.stderr)

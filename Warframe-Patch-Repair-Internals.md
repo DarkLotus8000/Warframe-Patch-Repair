@@ -20,13 +20,13 @@ The most important maintenance rule is this:
 > unless real files from later builds prove that rule still holds.**
 
 The current implementation was validated primarily against Update 44, especially U44.0.1
-and U44.0.2. U45 may preserve every relevant structure, change only one small field, or
+through U44.0.3. U45 may preserve every relevant structure, change only one small field, or
 change several independent layers at once. Treat the first U45 repair as a format-validation
 exercise rather than merely another test run.
 
 ---
 
-# 1. What problem this tool solves
+# 1. What problem this repair script solves
 
 Ninja Capture Tool can capture Warframe CDN objects used while updating/starting the
 game. The original standalone repair workflow was validated against v1.0-era captures. A
@@ -102,7 +102,7 @@ This is the NCT/OpenWF capture being repaired. A common shape is:
             ...
 ```
 
-The tool accepts several bounded roots and searches these layouts explicitly:
+The script accepts several bounded roots and searches these layouts explicitly:
 
 ```text
 <root>/OpenWF/Content
@@ -112,7 +112,10 @@ The tool accepts several bounded roots and searches these layouts explicitly:
 ```
 
 It does not recursively search arbitrary descendants. A recursively guessed root can select
-an old or unrelated patch directory and silently corrupt the evidence model.
+an old or unrelated patch directory and silently corrupt the evidence model. Across the bounded
+layouts above, a root containing `B.Cache.*` manifests is preferred over an earlier root that
+contains only `H.Cache.bin`; H.Cache-only evidence is used only when no supported root contains
+B.Cache manifests.
 
 ## 2.3 The target installation
 
@@ -257,6 +260,18 @@ other or with ordinary `Content/0` evidence.
 A type learned from a DX11 shader object must not become a generic answer for a DX12 shader
 with the same suffix.
 
+## 4.4 Voiceover language behavior
+
+The supplied U44.0.1/U44.0.2 target sets do not contain a separate `B.Cache.LanguageVO` or
+`B.Cache.VO*` family. Voice/dialog content is carried by the existing Windows language/variant
+manifests. In particular, the retained `Windows_en` and `Windows_zh` manifests contain dialog/audio
+paths, and manifest ownership remains authoritative even when a filename contains another language
+marker. For example, an `_en.wav` entry owned by `B.Cache.Windows_zh` maps to `Content/0_zh`.
+
+`LanguageVO` is therefore treated as launcher/runtime selection context, not as another manifest
+namespace grammar. Do not hard-code the currently observed VO choices into repair logic; future
+builds may add languages without changing the ownership rule.
+
 ---
 
 # 5. Target B.Cache manifests
@@ -269,7 +284,7 @@ The target manifests are the repairer's authoritative inventory of target logica
 For Update 44, the parser expects the SHCC-decoded manifest header to begin with:
 
 ```text
-GUID[16]
+embedded object hash[16]
 u32 version
 ```
 
@@ -296,15 +311,53 @@ manifest_hash[16]
 u32 info
 ```
 
-The `info` field is known to pack:
+The `info` field is retained in `ManifestAsset`. Current U43/U44 evidence establishes:
 
 ```text
-low 24 bits  -> size
-high 8 bits  -> flags
+bits  0..27  -> exact CDN object size in bytes
+bits 28..31  -> separate per-entry metadata
 ```
 
-The current repair algorithm does not need those size/flag semantics, so the parser advances
-over the value but does not retain it in `ManifestAsset`.
+The 28-bit size boundary is evidence-backed rather than inferred from small files. A real U44
+`Packages.bin` CDN object is 22,081,406 bytes and carries `info = 0x2150EF7E`; masking with
+`0x0FFFFFFF` yields exactly 22,081,406. An independent U43 `Packages.bin` above 16 MiB follows
+the same layout. The earlier 24-bit-size/high-8-bit-flags interpretation was therefore incomplete.
+
+The upper nibble is preserved but is not required for repair/download-size correctness. Research
+evidence strongly associates three of those bits with H/B/F cache participation, while bit 28
+remains intentionally unnamed until matching-build evidence proves its meaning. Do not make the
+download planner depend on that unresolved flag.
+
+Before asset downloading, the repairer preflights selected manifest candidates using the same
+local-object/type evidence rules needed to decide whether a CDN fetch is actually necessary. It
+sums `info & 0x0FFFFFFF` only for objects that still need the CDN. Final non-mutating preflight
+outcomes (for example, an already-valid local object or an unresolved type) are cached and reused
+by the result pass so the same local bytes are not immediately read and verified again. Cases that
+still require a copy, repair, or write are deliberately not cached as final results. The resulting
+manifest download list is then fetched through a bounded `ThreadPoolExecutor`; the default is two
+workers, matching the official PC updater's observed aggressive fetch pool. `-w 1` /
+`--download-workers 1` preserves the old sequential transport path, while values up to 16 are
+accepted for controlled experiments. Each worker may hold one complete CDN response in memory
+until verification and atomic saving finish, so increasing the worker count also increases peak
+memory pressure; 2 remains the compatibility-oriented default.
+
+`OverallDownloadProgress` is shared by the workers and keeps separate provisional byte counts per
+thread. One global row reports committed + active bytes, smoothed aggregate wire speed, ETA and
+completed-file count. The worker count is already printed once by the download plan, so the
+transient row deliberately does not append changing active-worker counts or filenames; this keeps
+the status width steadier and avoids duplicating information. The row stays transient at the bottom
+of the console: whenever an asset finishes, its permanent result line is printed above it and the
+aggregate row is immediately redrawn below. Retry/warning messages use the same locked message
+scope. Planned download results are therefore visible live and are not printed a second time during
+the later result-accounting pass. Per-file verification and saving rows are suppressed while this
+aggregate row is active so concurrent workers cannot fight for the same terminal line. Retry
+attempts remove only that worker's provisional completion so another active transfer is not
+disturbed. Native Oodle decompression is serialized with a small
+lock while network I/O remains concurrent; this avoids assuming undocumented thread-safety for the
+one shared DLL handle. A verified response whose real size differs from manifest metadata adjusts
+the running total and emits a warning rather than hiding the discrepancy. Direct OpenWF-404
+fallback objects are not part of this manifest-derived total because they do not carry manifest
+`info` metadata.
 
 The parser reads the `u32 version` field explicitly and accepts only:
 
@@ -346,7 +399,7 @@ referenced more than once.
 
 ## 5.4 Multiple manifests for one family are different
 
-The tool refuses to continue if the capture contains more than one target manifest for the
+The script refuses to continue if the capture contains more than one target manifest for the
 same cache family/language.
 
 For example, two different captured `B.Cache.Windows.bin!TYPE_HASH` objects would make it
@@ -354,6 +407,62 @@ unclear which target build is being repaired.
 
 The repairer does **not** merge them and does **not** choose the newest filesystem timestamp.
 That would turn stale capture debris into silent target-build selection.
+
+## 5.5 H.Cache meta-manifest completion
+
+`H.Cache.bin` sits one level above the B.Cache manifests. Its decoded header uses a 20-byte
+prefix followed by grouped path/hash records. The repairer structurally parses that table and
+selects only supported B.Cache paths; it does not hard-code the 19 families observed in U44.
+
+The official sentinel object is requested using the manifest type already observed on the
+captured B.Cache files. For U44 that is type `E`, producing:
+
+```text
+https://origin.warframe.com/origin/00000000/0/H.Cache.bin!E_---------------------w
+```
+
+Older target builds can therefore use their observed manifest type instead of forcing `E`. A
+captured/local H.Cache object is preferred when available. The official DE object is used only
+when the local copy is missing, unreadable, or does not match the captured target evidence. Both
+captured/local and official H.Cache inputs are capped at 16 MiB before decoding. Official responses
+check both Content-Length and actual streamed bytes; local files are size-checked and read through the
+same fixed upper bound. This prevents a broken or unexpected input from consuming unbounded memory
+before verification.
+
+The sentinel filename deliberately does not carry H.Cache's real object hash. The repairer
+therefore verifies its SHCC CRC32C and recomputes the embedded H-only object hash from the
+decoded header payload before trusting the table.
+
+Version matching is conservative. Every B.Cache manifest already present in the capture must:
+
+1. exist in H.Cache under the same logical path; and
+2. have exactly the same 16-byte target hash as the captured `B.Cache.*!TYPE_HASH` filename.
+
+If any overlapping manifest disagrees, the H.Cache candidate is treated as another build and
+no missing B.Cache files are downloaded from it. When all overlaps match, H.Cache becomes the
+authoritative family inventory for that target and the repairer downloads each missing B.Cache
+object by its exact H.Cache hash before parsing target assets.
+
+The `/B.Cache.Windows.bin` entry is also the cache-manifest/build hash used by OpenWF. Printing
+that value is useful diagnostics, but the repairer does not rely on that single entry alone when
+other captured B.Cache hashes are available; all overlaps must agree.
+
+This design fixes an important passive-capture limitation: the launcher can request individual
+`0_<language>` assets without re-requesting that language's B.Cache manifest during the same
+NCT session. H.Cache allows the standalone repairer to recover those omitted manifests without
+guessing a language list or silently mixing builds.
+
+A valid captured H.Cache can also bootstrap a capture with **zero initial B.Cache manifests**.
+In that case there is no overlap set to compare, so the script trusts only the captured/local
+H.Cache after its SHCC CRC and embedded self-hash verify; it does not fetch a live official
+H.Cache and guess that it belongs to an otherwise unidentified historical target. The captured
+H.Cache then supplies the complete B.Cache family inventory and exact target hashes.
+
+If no H.Cache candidate can be verified, the script may continue best-effort with the B.Cache
+manifests that are already present, but manifest coverage is explicitly marked `unverified`.
+An unverified coverage state is included in the final incomplete reasons and forces a non-zero
+exit status. This prevents a partial 14-of-19-style capture from ending with the misleading
+`Repair completed successfully.` message merely because every discovered candidate succeeded.
 
 ---
 
@@ -390,6 +499,12 @@ A direct SHCC object is accepted only if:
 3. CRC32C matches;
 4. the header chunk can be decoded;
 5. the embedded 16-byte hash equals the exact expected hash.
+
+CRC32C prefers the `google-crc32c` C extension when `google_crc32c.implementation == "c"`.
+The native checksum is updated in 1 MiB chunks, so excluding the stored four-byte footer does not
+require a second full-object copy. If the extension is absent or only its non-C implementation is
+available, the repairer uses its existing table-based Python CRC32C path. This keeps old/offline
+repair environments functional while allowing hardware/native acceleration in normal installs.
 
 ## 6.2 Observed U44 whole-object `0x43` wrapper
 
@@ -782,13 +897,15 @@ The current design therefore uses an evidence hierarchy rather than a static sna
 
 For a manifest asset, the current effective order is:
 
-1. exact path type observed in the current captured patch;
-2. patch-local `Packages.bin` parent -> type evidence;
-3. patch-local unambiguous filename/suffix evidence;
-4. matching current `Warframe.x64.exe` mappings;
-5. same-path original-base CommonHeader type hint;
-6. exact current-session OpenWF 404 type hint, only when a log was explicitly supplied;
-7. unresolved.
+1. exact namespace/path type observed in the current captured patch;
+2. same-path type observed elsewhere in the same namespace group, only when all observed types agree;
+3. patch-local `Packages.bin` parent -> type evidence;
+4. patch-local unambiguous filename/suffix evidence;
+5. matching current `Warframe.x64.exe` mappings;
+6. same-namespace/path original-base CommonHeader type hint;
+7. same-path original-base namespace-group CommonHeader type hint, only when all hints agree;
+8. exact current-session OpenWF 404 type hint, only when a log was explicitly supplied;
+9. unresolved.
 
 There is an additional optimization before ordinary resolution:
 
@@ -882,7 +999,7 @@ resolution it primarily needs:
 child logical path -> parent type path
 ```
 
-Those chains let the tool correlate already-observed CDN types with semantic/native parent
+Those chains let the script correlate already-observed CDN types with semantic/native parent
 classes.
 
 This is much stronger than guessing from a filename alone.
@@ -1237,7 +1354,7 @@ are skipped.
 
 ## 19.6 Matching EXE location
 
-The standalone tool currently looks only for:
+The standalone script currently looks only for:
 
 ```text
 <supplied-root>/Warframe.x64.exe
@@ -1274,17 +1391,26 @@ First choice inside patch resolution:
 
 This is extremely direct evidence.
 
-## 20.2 Patch-local Packages parent mapping
+## 20.2 Patch-local same-path namespace-group mapping
 
-If exact path evidence is absent, the tool follows the target path's Packages parent chain and
+If the exact namespace/path was not captured, the script next checks the same logical path in the
+namespace group. `0`, `0_de`, `0_en`, `0_ja` and the other language/variant namespaces share
+group `0`; DX11 and DX12 remain in their own groups. The fallback is retained only when every
+observed type for that grouped path agrees. Conflicting types deliberately leave the asset
+unresolved. This covers root-level service objects such as `/Languages.bin`, which do not pass
+through Packages/filename-pattern learning.
+
+## 20.3 Patch-local Packages parent mapping
+
+If same-path evidence is absent, the script follows the target path's Packages parent chain and
 checks whether one of those parents has an unambiguous type learned from the current patch.
 
-## 20.3 Patch-local filename pattern
+## 20.4 Patch-local filename pattern
 
 Next it checks unambiguous filename patterns in the relevant namespace group, preferring the
 longest matching pattern.
 
-## 20.4 Current EXE mapping
+## 20.5 Current EXE mapping
 
 If patch-local evidence does not resolve the type, the current EXE is queried.
 
@@ -1294,17 +1420,20 @@ patterns.
 Shader namespaces rely on the platform-aware extension rows rather than unsafe generic native
 mapping.
 
-## 20.5 Base CommonHeader type hint
+## 20.6 Base CommonHeader type hints
 
 Only after target-build patch/EXE evidence fails does normal repair use an unambiguous type
-from the same namespace/path in the original base.
+from the original base. The exact same namespace/path is preferred. If that exact hint is absent,
+the same logical path may fall back across the namespace group when every available base hint
+agrees on one type. This is especially useful when H.Cache restores a language manifest that was
+missing from the captured patch and exposes a changed root-level object such as `/Languages.bin`.
 
-Why is it lower priority?
+Why is base evidence lower priority?
 
 Because the base is an older build. Its type is often useful, but target-build evidence should
 win if the target changed the registration.
 
-## 20.6 OpenWF exact 404 fallback
+## 20.7 OpenWF exact 404 fallback
 
 Only when the user explicitly supplies `--openwf-log` can an exact current-session request
 provide the final type fallback for the same:
@@ -1384,7 +1513,7 @@ The `stripped` section is excluded before base comparison.
 This matters because omitted stripped assets must not later appear as "unknown" and make the
 run incomplete.
 
-The option is non-destructive. If a stripped object is already present in the patch, the tool
+The option is non-destructive. If a stripped object is already present in the patch, the script
 does not delete it.
 
 ## 22.3 `--only-stripped`
@@ -1397,7 +1526,11 @@ Changed/new stripped assets are exported to a **new separate output tree**:
 <output>/OpenWF/Content/...
 ```
 
-The source patch is used as an evidence/source pool but is not modified.
+The source patch is used as an evidence/source pool but is not modified. Before H.Cache/B.Cache
+completion, the script copies only the captured manifest metadata (`H.Cache.bin` and `B.Cache.*`)
+into a temporary staging directory. Any official H.Cache or missing B.Cache downloads are written
+there, the completed manifests are parsed, and the staging directory is removed before stripped
+asset repair begins. This keeps metadata recovery from mutating the source patch.
 
 If a required exact object already exists in the source patch and verifies, it is copied to the
 export. Otherwise the repairer resolves/downloads it normally.
@@ -1422,7 +1555,7 @@ Therefore a target manifest entry whose hash is byte-for-byte identical to the o
 is normally omitted from repair candidates.
 
 This is why pointing the repairer at only an update patch with no original base is insufficient
-for general completion. Without the base, the tool cannot distinguish:
+for general completion. Without the base, the script cannot distinguish:
 
 ```text
 missing because capture failed
@@ -1462,8 +1595,18 @@ The CDN base is:
 https://content.warframe.com/
 ```
 
-For each exact resolved object name, the repairer performs up to three HTTP attempts with a
-30-second timeout per attempt.
+For each exact resolved object name, the repairer performs up to three HTTP attempts through
+PyCURL/libcurl. The transport uses a 30-second connection timeout and aborts a transfer that
+stays below 1 byte/second for 30 seconds; redirects are followed up to five hops. TLS certificate
+and hostname verification remain enabled.
+
+Each worker thread keeps one libcurl easy handle in thread-local storage. The handle is reset
+between object requests, but libcurl deliberately keeps its live connection/DNS/session caches
+across `curl_easy_reset()`. This removes the old forced `Connection: close` request header and
+allows successive assets handled by the same worker to reuse a compatible persistent connection.
+With the default two repair workers this normally gives two independently reusable transfer
+handles without replacing the existing bounded `ThreadPoolExecutor` repair pipeline with a second
+concurrency model.
 
 Transient-style status codes currently eligible for retry include:
 
@@ -1505,7 +1648,7 @@ Benefits:
 
 ## 26.1 Disk reserve
 
-The tool keeps a safety headroom of:
+The script keeps a safety headroom of:
 
 ```text
 64 MiB
@@ -1558,6 +1701,7 @@ turning progress into a huge permanent log.
 Intentional behavior includes:
 
 - transient progress rows for scans/parsing;
+- stale characters from a longer transient frame are erased in-place and the cursor is returned to the end of the current frame instead of being left after invisible padding;
 - visible download/save/verify progress for sufficiently large/slow objects;
 - ANSI color only when the output stream supports it;
 - `NO_COLOR` disables color;
@@ -1577,7 +1721,7 @@ Current syntax:
 
 ```text
 warframe_patch_repair.py [-h] [-t] [-l OPENWF_LOG] [-n | -s]
-                         [-o STRIPPED_OUTPUT]
+                         [-o STRIPPED_OUTPUT] [-w N]
                          [root] [base]
 ```
 
@@ -1590,13 +1734,19 @@ Current aliases:
 -n --no-stripped
 -s --only-stripped
 -o --stripped-output
+-w --download-workers
 ```
 
-Important parser behavior:
+Important parser/runtime behavior:
 
 - long-option abbreviation is disabled;
 - `-n` and `-s` are a normal argparse mutually-exclusive group;
 - `--stripped-output` is validated after parsing and requires `--only-stripped`;
+- `-w` / `--download-workers` defaults to 2 and accepts 1-16; `run()` enforces the same bound for direct callers;
+- `run()` independently enforces the same mode contract for direct callers;
+- the supplied Steam base/`Cache.Windows` (including the presence of at least one usable regular `H.<package>.toc` file)
+  and an explicit OpenWF trace are validated before H.Cache/B.Cache completion is allowed to
+  write anything into the patch;
 - `--` retains argparse's standard end-of-options behavior.
 
 Older revisions carried custom code solely to reject duplicate short/long alias spellings and
@@ -1679,6 +1829,32 @@ One repair classification identified approximately:
 U44.0.2 testing also exposed the special `0x43` whole-object wrapper behavior for real B7 HDR
 and 8B WAV samples.
 
+## U44.0.3
+
+A full U44.0.3 repair against the original Steam base provided another real end-to-end validation:
+
+```text
+19/19 B.Cache manifests verified by captured H.Cache
+489,082 unique target manifest objects
+488,768 unchanged base objects
+314 changed/new objects
+0 unknown base objects
+403 proactive FontCache additions
+717 repair candidates
+510 planned CDN downloads / 473.8 MiB / 2 workers
+207 already present
+510 downloaded
+0 failed
+0 skipped
+0 manifest parse failures
+verified + complete manifest coverage
+```
+
+The section accounting also balanced exactly: the 403 packed candidates were 207 present + 196
+downloaded, while all 314 stripped candidates were downloaded. This run exercised the manifest
+size planner, two-worker libcurl path, Packages/EXE/patch-local type evidence, language namespaces,
+DX shader namespaces and a comparatively large stripped-asset update without unresolved types.
+
 ## FontCache follow-up
 
 A runtime FontCache failure proved that base-identical FontCache objects can still be required
@@ -1707,7 +1883,7 @@ A target manifest can correctly identify an exact object while Digital Extremes'
 
 That situation is distinct from a type-resolution or parser failure.
 
-The tool also does not promise:
+The script also does not promise:
 
 - support for every historical Packages.bin version;
 - support for every historical TOC/CommonHeader layout;
@@ -1733,6 +1909,7 @@ Keep untouched copies of:
 - target/update capture;
 - target `Warframe.x64.exe`;
 - every captured `B.Cache.*` manifest;
+- captured `H.Cache.bin` when available;
 - captured `Packages.bin` object(s);
 - NCT logs/session metadata;
 - OpenWF trace if runtime testing produces requests.
@@ -1743,11 +1920,12 @@ Confirm:
 
 - SHCC validation still passes;
 - record the exact manifest `u32 version` value before changing parser gates;
-- manifest header begins with the expected GUID/version area;
+- manifest header begins with the expected embedded-hash/version area;
 - service/packed/stripped ordering still matches;
 - entry framing still matches path length + path + 16-byte hash + info;
 - decoded payload is consumed exactly with no unexplained trailing bytes;
-- namespace naming conventions have not changed.
+- namespace naming conventions have not changed;
+- H.Cache still maps the target B.Cache family set/path hashes using the structurally parsed meta-manifest layout.
 
 If any of these fail, fix/document the manifest parser before trusting candidate counts.
 
@@ -1854,13 +2032,23 @@ Or run the test file directly from `tests`:
 py -B test_warframe_patch_repair.py -v
 ```
 
-The Packages-selection tests capture the repairer's transient stdout. This is intentional: the production progress renderer uses carriage returns on an interactive console, which would otherwise overwrite `unittest -v` status rows even though the tests themselves pass. The repair tool's normal progress behavior is unchanged. On Windows the test module enables console VT processing before `unittest` creates its result object, preserving Python 3.14's normal colored `ok`/`OK` output without relying on repair progress to enable VT as an accidental side effect.
+Tests that exercise transient progress directly capture the repairer's stdout. This is intentional: the production progress renderer uses carriage returns on an interactive console, which would otherwise overwrite `unittest -v` status rows even though the tests themselves pass. The repair script's normal progress behavior is unchanged. On Windows the test module enables console VT processing before `unittest` creates its result object, preserving Python 3.14's normal colored `ok`/`OK` output without relying on repair progress to enable VT as an accidental side effect.
 
 The documented commands use `-B`, so running the suite does not create `.pyc`/`__pycache__` files. Repository hygiene is intentionally small: `.gitignore` still excludes Python cache/test-environment artifacts, and `.gitattributes` normalizes text source/docs to LF while marking bundled binaries/archives as binary. Do not broaden the ignore list to captured logs, fixtures, or Warframe research data without a concrete reason; those may be intentional inputs.
 
-The focused suite currently contains 24 tests and covers the failure modes most likely to
+The focused suite currently contains 72 tests and covers the failure modes most likely to
 create a misleading future repair result:
 
+- H.Cache origin URL/type selection, structural parsing and embedded self-hash verification;
+- H.Cache target matching requires every captured B.Cache overlap to agree;
+- verified H.Cache metadata recovers missing B.Cache manifest objects before asset parsing, including independent missing DX11 and DX12 families;
+- a valid captured H.Cache can bootstrap the full manifest family set with zero initial B.Cache files;
+- an unprovable H.Cache/B.Cache target produces an explicit unverified coverage state, and unknown future coverage-state strings fail closed;
+- the top-level run returns non-zero and never prints success when manifest coverage is unverified;
+- stripped-only manifest metadata is staged separately, including a recovery-path test that proves missing B.Cache downloads cannot mutate the source patch;
+- captured/local and official H.Cache inputs are bounded by the same fixed 16 MiB limit, with official responses checked against both advertised and streamed sizes;
+- invalid direct `run()` mode combinations fail before content discovery, and invalid Steam-base/OpenWF-log inputs fail before manifest completion can mutate the patch;
+- an empty base `Cache.Windows`, one containing only an `H.*.toc` directory, or one containing only an empty-package `H..toc` file is rejected before manifest completion can mutate the patch;
 - Packages ambiguity is decided from integrity-valid objects before format parsing;
 - one unsupported Packages version raises `UnsupportedPackagesVersionError`;
 - one integrity-valid supported-version object with an unreadable layout raises `UnsupportedPackagesLayoutError`;
@@ -1870,13 +2058,30 @@ create a misleading future repair result:
 - manifest version 14 is accepted while unsupported versions are fatal and propagate out of manifest collection;
 - manifest truncation and unexplained trailing decoded-manifest bytes are rejected;
 - a sanitized real U44.0.2 `B.Cache.Windows_de.bin` header validates the real v14 section/path layout;
-- `_de` and `_xx` manifest ownership controls the `0_de`/`0_xx` namespace even for `_en`-named assets;
+- real manifest `info` metadata is retained and a >16 MiB `0x2150EF7E` fixture proves the 28-bit CDN-size mask;
+- manifest CDN planning returns the exact objects that still require a download, sums their 28-bit manifest sizes and excludes already-valid local objects;
+- the default two-worker manifest downloader actually overlaps two worker threads, while worker count 1 stays on the sequential path and `-w` forwards an explicit worker count;
+- completed planned downloads are emitted immediately as permanent rows while the aggregate progress row is restored below them;
+- verified non-download preflight results can be reused by the result pass instead of immediately re-reading the same local object;
+- manifest type fallback priority is centralized so preflight and the actual repair path cannot drift;
+- global download progress tracks simultaneous per-worker attempts, rolls failed retry bytes back from completion, suppresses per-file verification rows while active and adjusts the planned total when a verified response size differs;
+- libcurl transport tests prove same-thread easy-handle reuse across successive objects, omit the old `Connection: close` header, ignore redirect response bodies/lengths before the final 200 response, preserve bounded response-size failures and retry transient HTTP status codes on the same reusable handle;
+- transient-line coverage proves stale-tail padding returns the visible cursor to the end of the current frame instead of leaving it at the erased previous width;
+- CRC32C has known-vector coverage for the Python fallback and exercises native `google-crc32c` dispatch through the same public checksum interface;
+- `_de` and `_xx` manifest ownership controls the `0_de`/`0_xx` namespace even for `_en`-named assets, including a VO-style `_en.wav` owned by `Windows_zh`;
+- root-level `/Languages.bin` type resolution can reuse unambiguous same-path evidence across `Content/0*` language namespaces, while conflicting cross-language evidence remains unresolved;
+- DX11/DX12 patch-local evidence remains isolated (`9` vs `A`), and representative `H.*Dx11` / `H.*Dx12` base packages map to the corresponding namespace without cross-fallback;
+- original-base same-path namespace-group CommonHeader hints provide the same conservative fallback when patch-local evidence is absent;
 - manifest filename grammar accepts only unsuffixed DX11/DX12 and optional ASCII-alphanumeric Windows suffixes;
 - duplicate same-family target manifests are rejected instead of allowing stale manifest mixing;
 - truncated decoded manifests remain per-manifest parse failures rather than escaping the collection boundary;
 - direct SHCC CRC32C success/failure and embedded target-hash mismatch behavior are exercised;
 - the observed outer `0x43` whole-object wrapper is exercised for valid and corrupted CRC32C cases;
 - Oodle chunk payloads with unexplained trailing bytes are rejected;
+- malformed/truncated LZF streams, invalid back-references, and decompressed-size mismatches are rejected;
+- equal-sized framed Cache.Windows blocks are copied raw without invoking Oodle/LZF;
+- atomic writes retry synthetic disk-full failures during temporary-file creation and replacement while preserving the old destination until replacement succeeds and cleaning temporary files;
+- OpenWF exact 404 recovery is scoped to the latest `Using log file:` session boundary, while a log with no marker contributes no recovery objects;
 - Packages and Cache.Windows directory-enumeration errors are preserved instead of being misreported as missing data.
 
 These focused tests do not replace real Warframe fixtures. The broader matrix should continue
@@ -1895,11 +2100,7 @@ Useful additional cases include:
 - ambiguous filename pattern;
 - ambiguous Packages parent mapping;
 - ambiguous OpenWF exact 404 type;
-- raw Cache.Windows block where compressed == decompressed;
-- LZF decompression failures;
-- disk-full retry/atomic-write behavior;
 - Windows overlong path component;
-- current-session vs historical OpenWF logs.
 
 ## 34.2 Real fixture tests
 
@@ -1914,7 +2115,7 @@ Keep small legally/operationally appropriate metadata fixtures where possible fo
 The supplied U44.0.1/U44.0.2 B.Cache research set establishes version 14 across all 38
 manifest objects, including the large decoder-type-12 families. The embedded sanitized test
 fixture keeps one real manifest structure in the normal regression suite without retaining its
-original GUID or target hashes.
+original embedded object hash or target hashes.
 
 Real fixtures catch the exact category of mistake that synthetic tests often miss: a parser can
 be internally consistent while modeling the real binary incorrectly.
@@ -1937,6 +2138,19 @@ ActivityProgress
 DownloadProgress
 windows_quick_edit_disabled
 RepairArgumentParser
+```
+
+## H.Cache / target-manifest completion
+
+```text
+parse_h_cache_header
+h_cache_files
+_h_cache_b_cache_entries
+_h_cache_matches_captured
+_download_official_h_cache
+_matching_h_cache_index
+complete_target_manifests_from_h_cache
+_stage_manifest_evidence
 ```
 
 ## EXE/type extraction
@@ -1982,6 +2196,8 @@ cache_name
 cdn_url
 local_path
 download_asset
+plan_manifest_downloads
+repair_planned_manifest_downloads
 atomic_write
 repair_object
 ```
@@ -2049,7 +2265,14 @@ PATCH ROOT
   |
   +--> locate OpenWF/Content
   |
-  +--> validate/parse target B.Cache manifests
+  +--> load/verify captured H.Cache or fetch the official DE sentinel H.Cache
+  |       |
+  |       +--> compare every overlapping captured B.Cache hash
+  |       +--> captured H.Cache may bootstrap zero-B.Cache captures
+  |       +--> recover any missing B.Cache families by exact target hash
+  |       +--> mark coverage verified or unverified
+  |
+  +--> validate/parse the completed target B.Cache manifest set
   |       |
   |       +--> namespace + section + logical path + target hash
   |
@@ -2138,7 +2361,7 @@ actually trust.
 
 # 39. Relationship to Ninja Capture Tool / Ninja Patch Tool
 
-This script is a standalone repair utility for Ninja Capture Tool/OpenWF captures. Its original
+This is a standalone repair script for Ninja Capture Tool/OpenWF captures. Its original
 validation set was created with NCT v1.0-era captures; NCT v1.1 is intended to integrate this
 repair workflow directly because it already knows more about the capture session and can invoke
 repair at the appropriate point.
@@ -2146,7 +2369,7 @@ repair at the appropriate point.
 After that integration, the standalone implementation remains useful as:
 
 - a reference algorithm;
-- a recovery tool for old captures;
+- a recovery script for old captures;
 - a format research baseline;
 - a regression oracle when refactoring NCT integration.
 
