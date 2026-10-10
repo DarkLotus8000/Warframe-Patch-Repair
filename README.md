@@ -2,7 +2,7 @@
 
 Standalone repair script for incomplete Warframe update patches captured with **Ninja Capture Tool v1.0** for OpenWF/SpaceNinjaServer.
 
-NCT v1.1 is intended to perform this repair internally. This standalone script remains useful for existing/archived NCT v1.0 captures, diagnostics, recovery, and format research.
+NCT v2.0 is intended to perform this repair internally. This standalone script remains useful for existing/archived NCT v1.0 captures, diagnostics, recovery, and format research.
 
 The current implementation has been validated against **Warframe Update 44**, including U44.0.1 through U44.0.3. A future content update may change Packages.bin, B.Cache manifests, SHCC/Oodle framing, Cache.Windows, or Warframe.x64.exe type registration. Unsupported formats should be validated before parser support is widened.
 
@@ -27,7 +27,7 @@ py warframe_patch_repair.py <update-patch-root> <original-base-root>
 Example:
 
 ```text
-py warframe_patch_repair.py "D:\GitHub\U44.0.x\44.0.2" "D:\Warframe\U44-Steam-Base"
+py warframe_patch_repair.py "D:\GitHub\U44.0.x\44.0.2" "D:\Warframe\Original-Steam-Base"
 ```
 
 The base must be the original, unupdated Steam base used for the update capture, or its `Cache.Windows` directory. Normal repair modifies the supplied patch in place.
@@ -46,6 +46,7 @@ Before parsing the target B.Cache set, the repairer also tries to establish comp
 | `-n`, `--no-stripped` | Repair service + packed sections while excluding stripped entries. |
 | `-s`, `--only-stripped` | Export only changed/new stripped-section assets to a separate OpenWF/Content tree. H.Cache/B.Cache completion is staged temporarily so the source patch is not modified. |
 | `-o`, `--stripped-output <path>` | With `--only-stripped`, use this exact new output directory. |
+| `--base-fingerprint <SHA256>` | Optional previously verified original-base H.TOC fingerprint. Mismatch aborts before patch modifications. |
 | `-w <N>`, `--download-workers <N>` | Parallel manifest CDN asset downloads. Defaults to **2**; use `1` for sequential downloading/debugging. Accepted range: 1-16. |
 
 ### Argument rules
@@ -54,6 +55,7 @@ Before parsing the target B.Cache set, the repairer also tries to establish comp
 - `--no-stripped` and `--only-stripped` are mutually exclusive.
 - `--stripped-output` requires `--only-stripped`, and the destination must not already exist.
 - `-w` / `--download-workers` accepts 1-16. The default is 2, matching the official PC updater's aggressive two-fetch-worker behavior observed during reverse engineering. Each worker can hold one complete CDN object in memory while it is verified/saved, so very high worker counts trade additional memory for possible throughput and are mainly intended for experiments/debugging.
+- `--base-fingerprint` requires normal repair mode and a 64-hex SHA-256 value. The fingerprint covers the names and complete bytes of original-base `H.*.toc` files, not `H.*.cache` payloads or a verified Steam manifest. It is a consistency check, not proof that the base is authoritative.
 - Long-option abbreviation is disabled; standard `argparse` short-option behavior is otherwise retained.
 
 ## Examples
@@ -65,8 +67,35 @@ py warframe_patch_repair.py <patch> <base> -s -o "D:\Exports\U44-stripped"
 py warframe_patch_repair.py <patch> <base> -l "D:\OpenWF\trace.log"
 py warframe_patch_repair.py <patch> <base> -w 1
 py warframe_patch_repair.py <patch> <base> -w 4
+py warframe_patch_repair.py <patch> <base> --base-fingerprint <previously-recorded-64-hex-value>
 py warframe_patch_repair.py <patch> --patch-types-only
 ```
+
+## Original-base identity (optional)
+
+A normal run prints `[Base] H.TOC fingerprint: <SHA256>` before patch modification.
+After independently verifying that an original, **unupdated** Steam base is correct,
+record that fingerprint with the base's Steam manifest ID in your preservation notes.
+On subsequent runs, pass `--base-fingerprint <SHA256>` to stop early if the base TOC
+metadata differs (for example, when the wrong base directory was selected).
+The fingerprint is independent of absolute path and timestamps, and reading it does
+not modify the base. It does **not** authenticate the Steam depot, nor does it hash
+entire backing `.cache` archives. Without a supplied pinned value, the fingerprint
+is informative only and cannot determine whether the selected base is correct.
+
+## Interrupting downloads
+
+During parallel CDN completion, Ctrl+C cancels queued work and signals active workers.
+Workers check cancellation during libcurl transfers, retry delays, disk-space waits,
+and atomic writes; already completed objects remain intact, and interrupted temporary
+files are cleaned up. Main exits with status `130`. An in-progress native verification
+or operating-system filesystem call must finish before it can observe cancellation.
+Completed asset-result rows retain path order; per-worker retry/warning messages are
+printed immediately using a shared console lock. A worker waiting for disk space
+prints one `[Waiting]` message and one `[Resumed]` message on recovery (instead of
+competing with other workers' transient progress lines).
+The previous high-rate `[Completion] Processing ...` status spam is no longer printed
+after planned downloads; the section summary still reports every candidate.
 
 ## Important behavior
 
@@ -81,12 +110,13 @@ py warframe_patch_repair.py <patch> --patch-types-only
 - A single integrity-valid unsupported/changed Packages layout is fatal.
 - Missing or integrity-broken Packages metadata remains non-fatal because other type evidence can still complete a repair.
 - Existing/downloaded objects must pass exact container/hash verification. CRC32C uses the native `google-crc32c` C backend when it is actually available; otherwise the built-in Python implementation remains the compatibility fallback.
-- Manifest entry `info` metadata is retained. For the evidenced U43/U44 layout, the low 28 bits are the exact CDN object size; this is validated by real objects above the old 24-bit/16 MiB boundary. The upper nibble remains separate metadata and is not required for download-size planning.
-- Before asset downloads begin, the repairer checks which selected objects are already valid/copyable and prints the remaining manifest CDN file count and total byte size. Final non-mutating preflight outcomes such as already-valid local objects and unresolved types are cached for the result pass, avoiding an immediate duplicate validation read. Manifest CDN transfers use **2 bounded workers by default** (`-w 1` restores sequential behavior). PyCURL/libcurl keeps one reusable easy handle per worker thread; the old forced `Connection: close` behavior is gone, allowing libcurl to reuse compatible persistent connections across successive assets. Each finished asset is printed permanently above the one transient bottom `[Download]` row; that row is immediately restored after completion/retry/warning messages and reports combined progress, smoothed speed and ETA. Per-file verification/saving rows are suppressed while the aggregate row owns the console. Native Oodle decompression is serialized behind the concurrent network transfers rather than assuming undocumented thread-safety for the shared DLL handle. Verified response-size mismatches adjust the running total instead of silently corrupting progress. Direct OpenWF-404 fallback objects remain outside that manifest-derived total.
+- Manifest entry `info` metadata is retained. For the evidenced U43/U44 layout, the low **29 bits** are the exact CDN object size. U43 `/Lotus/Videos/ShrinesIntro.bk2` is the boundary fixture: `info = 0xB0466F76`, while its observed H+F payload sizes plus direct-container framing total **273,051,510 bytes = 0x10466F76**, proving that bit 28 is size bit 28 rather than a metadata flag. Bits 29/30/31 correlate with H/B/F participation respectively.
+- Before asset downloads begin, the repairer checks which selected objects are already valid/copyable and prints the remaining manifest CDN file count and total byte size. Final non-mutating preflight outcomes such as already-valid local objects and unresolved types are cached for the result pass, avoiding an immediate duplicate validation read. Manifest CDN transfers use **2 bounded workers by default** (`-w 1` restores sequential behavior). PyCURL/libcurl keeps one reusable easy handle per worker thread; the old forced `Connection: close` behavior is gone, allowing libcurl to reuse compatible persistent connections across successive assets. Completed CDN results are displayed permanently in logical-path order (including numbered ability assets), regardless of which worker finishes first. A finished result may be held briefly until earlier paths finish; downloads and the transient bottom `[Download]` progress row continue independently. The row is restored after result/retry/warning messages and reports combined progress, smoothed speed and ETA. Per-file verification/saving rows are suppressed while the aggregate row owns the console. Native Oodle decompression is serialized behind the concurrent network transfers rather than assuming undocumented thread-safety for the shared DLL handle. Verified response-size mismatches adjust the running total instead of silently corrupting progress. Direct OpenWF-404 fallback objects remain outside that manifest-derived total.
 - Type/metadata ambiguity is not guessed away. Same-path type evidence can cross `Content/0*` language namespaces only when all observed types agree; conflicting language-family evidence stays unresolved.
 - Writes are atomic; low/full-disk handling preserves a 64 MiB reserve.
 - Parsed manifest summaries show the observed version, for example `v14`, alongside service/packed/stripped counts.
 - Run-mode combinations, the supplied Steam base/`Cache.Windows` (including the presence of at least one usable regular `H.<package>.toc` file), and an explicit OpenWF log are validated before H.Cache/B.Cache completion can modify the patch. `run()` enforces the same mode contract as the CLI for direct callers.
+- The modern Cache.Windows reader supports the encodings observed in the fully scanned original, unupdated Steam base used for the U44 validation runs: raw/stored blocks and blocks matching the observed Oodle `0x8C` marker. That scan covered **95 archives, 1,089,950 live entries and 1,592,680 blocks** with **267,860 raw/stored, 1,324,820 `0x8C` Oodle-classified, 0 LZ/LZF-compatible, 0 unknown and 0 scan errors**. The scanner classified `0x8C` blocks by the observed marker rather than decompressing every block solely for codec identification. Other compressed encodings now fail closed instead of being guessed as legacy LZ/LZF.
 - Unverified B.Cache coverage, unresolved types, unknown base classification, and parse/download failures make the run incomplete and return a non-zero status. Ctrl+C returns 130.
 
 ## Tests
@@ -109,7 +139,7 @@ Or run the file directly from `tests`:
 py -B test_warframe_patch_repair.py -v
 ```
 
-The focused suite contains **72 tests** covering H.Cache parsing/self-hash validation, missing-manifest completion including independent DX11/DX12 recovery, captured-H.Cache-only bootstrap, fail-closed/unverified coverage status, end-to-end non-destructive stripped-manifest staging, bounded captured/official H.Cache inputs, fail-fast run/base/OpenWF-log validation, latest-session OpenWF 404 scoping, B.Cache-over-H.Cache content-root precedence, Packages compatibility boundaries, manifest v14, real U44 language-manifest structure and 28-bit CDN-size metadata, `_de`/`_xx` namespace ownership, VO-style language-manifest ownership, cross-language same-path type resolution with ambiguity rejection, DX11/DX12 type-evidence isolation and base-package namespace mapping, strict manifest filename grammar and duplicate-family rejection, direct and outer-`0x43` SHCC CRC/hash validation, Oodle trailing-payload rejection, strict LZF failure handling, raw framed Cache.Windows blocks, manifest CDN planning/global progress retry accounting, pinned-bottom aggregate progress with live finished-asset rows, preflight-result reuse, shared manifest type-fallback resolution, configurable two-worker concurrency/sequential fallback including the `-w` alias, libcurl connection-handle reuse, redirect-body isolation and transient-HTTP retry behavior, transient-line cursor restoration after stale-tail erasure, native/google CRC32C selection with Python fallback, atomic-write/disk-full retry safety, optional EXE-extractor failure normalization, and filesystem-enumeration diagnostics.
+The focused suite contains **85 tests** covering H.Cache parsing/self-hash validation, missing-manifest completion including independent DX11/DX12 recovery, captured-H.Cache-only bootstrap, fail-closed/unverified coverage status, end-to-end non-destructive stripped-manifest staging, bounded captured/official H.Cache inputs, fail-fast run/base/OpenWF-log validation, latest-session OpenWF 404 scoping, B.Cache-over-H.Cache content-root precedence, Packages compatibility boundaries, manifest v14, real U44 language-manifest structure and 29-bit CDN-size metadata, `_de`/`_xx` namespace ownership, VO-style language-manifest ownership, cross-language same-path type resolution with ambiguity rejection, DX11/DX12 type-evidence isolation and base-package namespace mapping, strict manifest filename grammar and duplicate-family rejection, direct and outer-`0x43` SHCC CRC/hash validation, Oodle trailing-payload rejection, raw framed Cache.Windows blocks and intentional fail-closed rejection of valid legacy LZF, manifest CDN planning/global progress retry accounting, pinned-bottom aggregate progress with path-ordered finished-asset rows, cooperative Ctrl+C cancellation of queued/running workers, consolidated disk-wait messages, optional base-TOC fingerprint verification, preflight-result reuse, shared manifest type-fallback resolution, configurable two-worker concurrency/sequential fallback with deterministic output ordering and the `-w` alias, libcurl connection-handle reuse, redirect-body isolation and transient-HTTP retry behavior, transient-line cursor restoration after stale-tail erasure, native/google CRC32C selection with Python fallback, atomic-write/disk-full retry safety, Windows-safe generated CDN path rejection, malformed Cache.Windows TOC numeric-field rejection, cache-entry backing-file bounds rejection, optional EXE-extractor failure normalization, and filesystem-enumeration diagnostics.
 
 The `-B` flag prevents the test runs themselves from creating `.pyc`/`__pycache__` files. The test harness also suppresses transient repair-progress output so verbose `unittest` rows remain readable; on Windows it enables console VT processing up front so Python 3.14 can retain its normal colored `ok`/`OK` output without depending on repair progress as a side effect. `.gitignore` still excludes Python cache/test-environment artifacts from Git, while `.gitattributes` keeps source/docs on LF and marks bundled binaries as binary.
 
@@ -117,3 +147,46 @@ The `-B` flag prevents the test runs themselves from creating `.pyc`/`__pycache_
 
 If U45+ changes manifest version 14, Packages version 46, SHCC/Oodle framing, Cache.Windows, or Warframe.x64.exe registration patterns, validate the new real format first. Do not widen version checks merely to make a new build run.
 
+
+## U43 manifest/cache research helper
+
+The full research bundle also includes `dump_u43_manifest_info.py`. It is a read-only helper for
+correlating final-U43 `B.Cache` manifest `info` bits with a pre-U43 Steam-base `Cache.Windows`.
+
+Keep the helper next to `warframe_patch_repair.py` and `oo2core_9.dll`, then run:
+
+```text
+py dump_u43_manifest_info.py "D:\U43 Research"
+```
+
+The research root should contain one pre-U43 `Cache.Windows` directory with the available
+`H.*`, `B.*`, and `F.*` `.toc`/`.cache` files plus the final-U43 `B.Cache*.bin!<hash>` objects.
+The helper validates every cache file/range referenced by the TOCs, then reads/decompresses
+matching H-cache payloads and compares their leading hashes with the final-U43 manifest hashes.
+Standard CommonHeaders are decoded further for type metadata; known non-CommonHeader H payloads
+remain valid hash evidence rather than being mislabeled as parser failures.
+
+The normal correlation outputs are followed by a focused bit-28 probe. For every bit-28 candidate
+the helper compares same-extension/same-cache-family peers, expands CommonHeader source-path and
+attribute fields, records H/B/F TOC sizes, samples a few nearby cache payloads, and searches any
+`CachePlan.txt` below the research root for the candidate path. Optional cross-build probing can
+also be supplied without changing the main U43 dataset:
+
+```text
+py dump_u43_manifest_info.py "D:\U43 Research" ^
+  --compare-manifest-dir "D:\U44.0.1 b.cache" ^
+  --compare-manifest-dir "D:\U44.0.2 b.cache"
+```
+
+Each comparison directory should contain one extracted build's `B.Cache*.bin!<hash>` objects.
+The helper is read-only and does not modify game/cache files. If multiple `Cache.Windows`
+directories are below the research root, select the intended pre-U43 base with `--cache-dir`.
+
+The helper intentionally remains a separate research frontend. It imports the production
+`warframe_patch_repair.py` module and reuses its real manifest, SHCC/Oodle and Cache.Windows
+parsers, so the binary-format logic is not duplicated. Keeping the expensive CSV/CachePlan/
+cross-build experiments outside the normal repair CLI lets research assumptions change without
+adding risk or surface area to ordinary patch repair. Proven findings that affect correctness can
+then be moved into the repairer itself.
+
+Zip and return the generated `u43_analysis_output` directory for analysis.

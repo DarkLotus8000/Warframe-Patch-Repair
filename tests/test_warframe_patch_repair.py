@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import CancelledError
 import importlib.util
 import io
 import struct
 import sys
 import threading
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -113,6 +115,8 @@ class FakePycurl:
     HEADERFUNCTION = 13
     WRITEFUNCTION = 14
     RESPONSE_CODE = 15
+    NOPROGRESS = 16
+    XFERINFOFUNCTION = 17
     error = FakeCurlError
 
     def __init__(self, responses):
@@ -474,7 +478,7 @@ class ManifestHeaderTests(unittest.TestCase):
             {path for _, path, _, _ in rows},
         )
 
-    def test_manifest_info_uses_28_bit_cdn_size(self) -> None:
+    def test_manifest_info_uses_29_bit_cdn_size(self) -> None:
         asset = repair.ManifestAsset(
             namespace="0",
             section="service",
@@ -483,8 +487,23 @@ class ManifestHeaderTests(unittest.TestCase):
             info=0x2150EF7E,
         )
         self.assertEqual(asset.cdn_size, 22_081_406)
-        self.assertEqual(asset.cache_flags, 0x2)
         self.assertGreater(asset.cdn_size, 0xFFFFFF)
+
+        # U43 /Lotus/Videos/ShrinesIntro.bk2 proves bit 28 belongs to
+        # the size, not the cache-membership flags. Its H+F cache payloads
+        # are 134 + 273,051,336 bytes and the observed direct-container
+        # overhead for these VideoTexture objects is 40 bytes:
+        # 134 + 273,051,336 + 40 = 273,051,510 = 0x10466F76.
+        large = repair.ManifestAsset(
+            namespace="0",
+            section="packed",
+            logical_path="/Lotus/Videos/ShrinesIntro.bk2",
+            manifest_hash=bytes(range(16)),
+            info=0xB0466F76,
+        )
+        self.assertEqual(large.cdn_size, 273_051_510)
+        self.assertEqual(large.cdn_size, 0x10466F76)
+        self.assertGreater(large.cdn_size, 0x0FFFFFFF)
 
     def test_u44_language_manifest_owner_controls_namespace_and_summary_version(self) -> None:
         header = base64.b64decode(U44_V14_DE_MANIFEST_SANITIZED_B64)
@@ -1307,19 +1326,35 @@ class ShccOodleTests(unittest.TestCase):
         ):
             repair._decompress_oodle_payload(payload, decompressed_size, FakeOodle())
 
-    def test_lzf_decompression_failures_are_strict(self) -> None:
-        cases = [
-            ("truncated literal run", b"\x02AB", 3, "Truncated LZF literal run"),
-            ("truncated extended length", b"\xE0", 1, "Truncated LZF length"),
-            ("truncated back-reference", b"\x20", 1, "Truncated LZF back-reference"),
-            ("invalid back-reference", b"\x20\x00", 1, "Invalid LZF back-reference"),
-            ("wrong decompressed size", b"\x00A", 2, r"LZF produced 1 bytes; expected 2\."),
-        ]
+    def test_cache_windows_legacy_lzf_compression_is_rejected(self) -> None:
+        # Valid LZF stream: control 0x02 encodes a three-byte literal run ("ABC").
+        # The modern reader intentionally rejects legacy LZF instead of decoding it.
+        block = b"\x02ABC"
+        decompressed_size = 3
+        num1 = 0x80000000 | (len(block) << 2)
+        num2 = (decompressed_size << 5) | 1
+        framed = num1.to_bytes(4, "big") + num2.to_bytes(4, "big") + block
 
-        for label, data, expected_size, message in cases:
-            with self.subTest(label=label):
-                with self.assertRaisesRegex(repair.RepairError, message):
-                    repair.lzf_decompress(data, expected_size)
+        class RejectOodle:
+            def decompress(self, _block: bytes, _expected_size: int) -> bytes:
+                raise AssertionError("legacy LZF must not be sent to Oodle")
+
+        with tempfile.TemporaryDirectory() as temp:
+            cache_path = Path(temp) / "H.Cache.Windows.cache"
+            cache_path.write_bytes(framed)
+            entry = repair.CacheEntry(
+                cache_path=cache_path,
+                logical_path="/SyntheticLegacyLzf",
+                offset=0,
+                compressed_len=len(framed),
+                length=decompressed_size,
+            )
+
+            with self.assertRaisesRegex(
+                repair.RepairError,
+                "Unsupported Cache.Windows compression format",
+            ):
+                repair.decompress_cache_entry(entry, RejectOodle())
 
     def test_cache_windows_equal_framed_block_is_copied_raw(self) -> None:
         payload = b"raw!"
@@ -1345,6 +1380,70 @@ class ShccOodleTests(unittest.TestCase):
             self.assertEqual(repair.decompress_cache_entry(entry, RejectOodle()), payload)
 
 class FilesystemDiagnosticTests(unittest.TestCase):
+    def test_local_path_rejects_windows_escape_and_normalized_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            invalid_names = (
+                "C:/escape!1_hash",
+                "0/Lotus/asset:stream!1_hash",
+                r"0\Lotus\escape!1_hash",
+                "0/../escape!1_hash",
+                "0/./escape!1_hash",
+                "0//escape!1_hash",
+            )
+            for name in invalid_names:
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(repair.RepairError, "Unsafe CDN path generated"):
+                        repair.local_path(root, name)
+
+    def test_iter_toc_entries_rejects_negative_live_file_fields(self) -> None:
+        cases = (
+            ("cache offset", -2, 1, 1, "negative cache offset"),
+            ("compressed length", 0, -1, 1, "negative compressed length"),
+            ("decompressed length", 0, 1, -1, "negative decompressed length"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            toc_path = Path(temp) / "H.Synthetic.toc"
+            for label, cache_offset, compressed_len, length, message in cases:
+                with self.subTest(field=label):
+                    entry = repair.TOC_ENTRY.pack(
+                        cache_offset,
+                        1,
+                        compressed_len,
+                        length,
+                        0,
+                        0,
+                        b"Asset",
+                    )
+                    toc_path.write_bytes(
+                        struct.pack("<II", repair.TOC_MAGIC, 20) + entry
+                    )
+                    with self.assertRaisesRegex(repair.RepairError, message):
+                        list(repair.iter_toc_entries(toc_path))
+
+    def test_read_cache_entry_raw_rejects_out_of_bounds_ranges_before_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_path = Path(temp) / "H.Synthetic.cache"
+            cache_path.write_bytes(b"12345678")
+            cases = (
+                ("offset beyond EOF", 9, 0),
+                ("range beyond EOF", 6, 3),
+            )
+            for label, offset, compressed_len in cases:
+                with self.subTest(case=label):
+                    entry = repair.CacheEntry(
+                        cache_path=cache_path,
+                        logical_path="/SyntheticOutOfBounds",
+                        offset=offset,
+                        compressed_len=compressed_len,
+                        length=compressed_len,
+                    )
+                    with self.assertRaisesRegex(
+                        repair.RepairError,
+                        "Cache.Windows entry exceeds cache file bounds",
+                    ):
+                        repair.read_cache_entry_raw(entry)
+
     def test_atomic_write_retries_disk_full_without_losing_destination(self) -> None:
         real_mkstemp = repair.tempfile.mkstemp
         real_replace = repair.os.replace
@@ -1502,7 +1601,7 @@ class DownloadPlanningTests(unittest.TestCase):
                     cached_results=cached_results,
                 )
 
-        key = (asset.namespace, asset.logical_path, asset.hash_b64)
+        key = asset.key
         self.assertEqual(planned, [])
         self.assertEqual(total, 0)
         self.assertEqual(
@@ -1628,14 +1727,14 @@ class DownloadPlanningTests(unittest.TestCase):
         with redirect_stdout(output):
             progress = repair.OverallDownloadProgress(300, 2)
             with patch.object(repair.threading, "get_ident", return_value=101):
-                progress.start_attempt("first", 100)
+                progress.start_attempt(100)
                 progress.update(40)
             with patch.object(repair.threading, "get_ident", return_value=202):
-                progress.start_attempt("second", 200)
+                progress.start_attempt(200)
                 progress.update(60)
 
             self.assertEqual(len(progress._active), 2)
-            self.assertEqual(sum(item[2] for item in progress._active.values()), 100)
+            self.assertEqual(sum(item[1] for item in progress._active.values()), 100)
             self.assertEqual(progress.wire_bytes, 100)
 
             with patch.object(repair.threading, "get_ident", return_value=101):
@@ -1725,7 +1824,7 @@ class DownloadPlanningTests(unittest.TestCase):
         self.assertEqual(bytes(body), b"data")
         self.assertEqual(status, 200)
         self.assertEqual(progress.wire_bytes, 4)
-        self.assertEqual(sum(item[2] for item in progress._active.values()), 4)
+        self.assertEqual(sum(item[1] for item in progress._active.values()), 4)
 
     def test_libcurl_retries_transient_http_status_on_same_handle(self) -> None:
         fake_curl = FakePycurl([
@@ -1758,13 +1857,13 @@ class DownloadPlanningTests(unittest.TestCase):
     def test_overall_download_progress_rolls_back_retry_and_adjusts_total(self) -> None:
         with redirect_stdout(io.StringIO()):
             progress = repair.OverallDownloadProgress(300, 2)
-            progress.start_attempt("first", 100)
+            progress.start_attempt(100)
             progress.update(40)
             progress.rollback_attempt()
             self.assertEqual(progress.completed, 0)
             self.assertEqual(progress.wire_bytes, 40)
 
-            progress.start_attempt("first", 100)
+            progress.start_attempt(100)
             progress.update(120)
             progress.commit_attempt(120)
 
@@ -1832,7 +1931,7 @@ class DownloadPlanningTests(unittest.TestCase):
         self.assertEqual(type_id, 0x11)
         self.assertEqual(source, "original base same-path CommonHeader type hint")
 
-    def test_planned_downloads_report_finished_assets_immediately(self) -> None:
+    def test_planned_downloads_report_finished_assets_in_path_order(self) -> None:
         assets = [
             repair.ManifestAsset(
                 namespace="0",
@@ -1841,7 +1940,7 @@ class DownloadPlanningTests(unittest.TestCase):
                 manifest_hash=bytes([index]) * 16,
                 info=0x20000004,
             )
-            for index in (1, 2)
+            for index in (2, 1)
         ]
 
         def fake_repair(asset, **_kwargs):
@@ -1874,6 +1973,229 @@ class DownloadPlanningTests(unittest.TestCase):
         text = output.getvalue()
         self.assertEqual(text.count("Finished1.bin"), 1)
         self.assertEqual(text.count("Finished2.bin"), 1)
+        self.assertLess(text.index("Finished1.bin"), text.index("Finished2.bin"))
+
+    def test_parallel_download_results_are_ordered_despite_reverse_completion(self) -> None:
+        assets = [
+            repair.ManifestAsset(
+                namespace="0",
+                section="packed",
+                logical_path=f"/Lotus/AbilityVideos/AshPower{index}_s.bk2",
+                manifest_hash=bytes([index]) * 16,
+                info=0x20000004,
+            )
+            for index in (4, 2, 3, 1)
+        ]
+        second_finished = threading.Event()
+        completion_order: list[int] = []
+        completion_lock = threading.Lock()
+
+        def fake_repair(asset, **_kwargs):
+            number = int(asset.logical_path.split("AshPower")[1].split("_")[0])
+            if number == 1:
+                if not second_finished.wait(timeout=3.0):
+                    raise AssertionError("Second worker did not run in parallel")
+                # Ensure the second future completes before the first one.
+                time.sleep(0.05)
+            with completion_lock:
+                completion_order.append(number)
+            if number == 2:
+                second_finished.set()
+            name = f"0{asset.logical_path}!AA_{asset.hash_b64}"
+            return "downloaded", "CDN", name, 200
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            repair, "repair_manifest_asset", side_effect=fake_repair
+        ), redirect_stdout(output):
+            root = Path(temp)
+            results = repair.repair_planned_manifest_downloads(
+                assets,
+                content_root=root,
+                source_content_root=root,
+                oodle=object(),
+                resolver=repair.TypeResolver(None, None, None),
+                label="Completion",
+                base_type_hints={},
+                base_group_type_hints={},
+                openwf_hints={},
+                overall_progress=repair.OverallDownloadProgress(16, 4),
+                workers=2,
+            )
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual(completion_order[0], 2)
+        rows = [line for line in output.getvalue().splitlines() if line.startswith("[200]")]
+        self.assertEqual(len(rows), 4)
+        for number, row in enumerate(rows, 1):
+            self.assertIn(f"AshPower{number}_s.bk2", row)
+
+
+    def test_base_toc_fingerprint_is_stable_and_detects_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            for directory in (first, second):
+                (directory / "H.Windows.toc").write_bytes(b"base toc data")
+                (directory / "H.Windows_en.toc").write_bytes(b"english toc")
+            fingerprint = repair.base_toc_fingerprint(first)
+            self.assertEqual(len(fingerprint), 64)
+            self.assertEqual(fingerprint, repair.base_toc_fingerprint(second))
+            (second / "H.Windows.toc").write_bytes(b"base toc DATA")
+            self.assertNotEqual(fingerprint, repair.base_toc_fingerprint(second))
+
+    def test_incorrect_pinned_base_rejected_before_patch_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            patch_root = root / "patch"
+            base_root = root / "base"
+            cache_dir = base_root / "Cache.Windows"
+            patch_root.mkdir()
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "H.Windows.toc").write_bytes(b"header")
+            with patch.object(repair, "resolve_content_root") as resolve, redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(repair.RepairError, "fingerprint differs"):
+                    repair.run(patch_root, base_root, expected_base_fingerprint="0" * 64)
+                resolve.assert_not_called()
+
+    def test_pinned_base_fingerprint_cli_validation(self) -> None:
+        cases = (
+            (["patch", "base", "--base-fingerprint", "garbage"], "64 hexadecimal"),
+            (["patch", "--patch-types-only", "--base-fingerprint", "0" * 64], "cannot be combined"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments), patch.object(
+                repair.sys, "argv", ["warframe_patch_repair.py", *arguments]
+            ), patch.object(repair.sys, "stderr", io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as caught:
+                    repair.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
+
+    def test_worker_disk_wait_is_coordinated_and_resumable(self) -> None:
+        from collections import namedtuple
+        DiskUsage = namedtuple("DiskUsage", "total used free")
+        progress = repair.OverallDownloadProgress(10, 1)
+        event = threading.Event()
+        free_values = iter((1, 1, repair.DISK_SAFETY_HEADROOM_BYTES + 10))
+        lines = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            repair.shutil, "disk_usage",
+            side_effect=lambda _path: DiskUsage(4 * 1024**3, 0, next(free_values)),
+        ), patch.object(repair.threading.Event, "wait", return_value=False), patch.object(
+            repair, "_warn_low_disk_space"
+        ), redirect_stdout(lines):
+            with repair._download_worker_context(event, progress):
+                repair._wait_for_disk_space(Path(temp), 4, "test asset")
+        output = lines.getvalue()
+        self.assertEqual(output.count("[Waiting]"), 1)
+        self.assertEqual(output.count("[Resumed]"), 1)
+
+    def test_cancelled_disk_wait_aborts_without_busy_loop(self) -> None:
+        progress = repair.OverallDownloadProgress(1, 1)
+        event = threading.Event()
+        event.set()
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            repair.shutil, "disk_usage"
+        ) as usage:
+            with repair._download_worker_context(event, progress):
+                with self.assertRaises(CancelledError):
+                    repair._wait_for_disk_space(Path(temp), 10, "cancelled asset")
+            usage.assert_not_called()
+
+    def test_cancelled_atomic_write_preserves_previous_file(self) -> None:
+        progress = repair.OverallDownloadProgress(1, 1)
+        event = threading.Event()
+        event.set()
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "asset.bin"
+            destination.write_bytes(b"unchanged")
+            with repair._download_worker_context(event, progress):
+                with self.assertRaises(CancelledError):
+                    repair.atomic_write(destination, b"replacement")
+            self.assertEqual(destination.read_bytes(), b"unchanged")
+            self.assertEqual(list(Path(temp).glob(".wfpr-*.tmp")), [])
+
+    def test_ctrl_c_cancels_queued_downloads_and_stops_running_workers(self) -> None:
+        assets = [
+            repair.ManifestAsset(
+                namespace="0", section="packed", logical_path=f"/Asset{number}.bin",
+                manifest_hash=bytes([number]) * 16, info=0x20000004,
+            )
+            for number in range(1, 7)
+        ]
+        entered = threading.Event()
+        cancelled = threading.Event()
+        seen: list[int] = []
+        lock = threading.Lock()
+
+        def fake_repair(asset, **_kwargs):
+            with lock:
+                seen.append(int(asset.logical_path.split("Asset")[1].split(".")[0]))
+            entered.set()
+            event = repair._WORKER_CONTEXT.cancel_event
+            if event.wait(timeout=3.0):
+                cancelled.set()
+                raise CancelledError()
+            raise AssertionError("Worker was not cancelled")
+
+        def fake_as_completed(_futures):
+            if not entered.wait(timeout=3.0):
+                raise AssertionError("Worker not started")
+            raise KeyboardInterrupt()
+            yield  # Ensure generator exception occurs during result iteration.
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            repair, "repair_manifest_asset", side_effect=fake_repair
+        ), patch.object(repair, "as_completed", side_effect=fake_as_completed), redirect_stdout(io.StringIO()):
+            root = Path(temp)
+            with self.assertRaises(KeyboardInterrupt):
+                repair.repair_planned_manifest_downloads(
+                    assets, content_root=root, source_content_root=root,
+                    oodle=object(), resolver=repair.TypeResolver(None, None, None),
+                    label="Completion", base_type_hints={}, base_group_type_hints={},
+                    openwf_hints={}, overall_progress=repair.OverallDownloadProgress(20, 6),
+                    workers=2,
+                )
+        self.assertTrue(cancelled.is_set())
+        self.assertLessEqual(len(seen), 2)
+
+    def test_download_cancellation_during_curl_callback(self) -> None:
+        event = threading.Event()
+        progress = repair.OverallDownloadProgress(4, 1)
+        fake_curl = FakePycurl([{"status": 200, "content_length": 4, "chunks": [b"data"]}])
+        real_perform = FakeCurl.perform
+
+        def interrupted_perform(handle):
+            event.set()
+            real_perform(handle)
+
+        with patch.object(repair, "_pycurl", fake_curl), patch.object(
+            repair, "_CURL_LOCAL", threading.local()
+        ), patch.object(FakeCurl, "perform", interrupted_perform), redirect_stdout(io.StringIO()):
+            with repair._download_worker_context(event, progress):
+                with self.assertRaises(CancelledError):
+                    repair.download_asset(
+                        "https://example.invalid/asset", display_name="asset",
+                        expected_hash="hash", oodle=object(), expected_size=4,
+                        overall_progress=progress,
+                    )
+        self.assertEqual(fake_curl.created, 1)
+        self.assertIn(fake_curl.XFERINFOFUNCTION, fake_curl.handles[0].options)
+        self.assertEqual(progress.completed, 0)
+
+    def test_redirected_output_not_colored_from_stale_stream_cache(self) -> None:
+        buffer = io.StringIO()
+        repair._COLOR_SUPPORT[id(buffer)] = True
+        try:
+            self.assertEqual(repair._enable_console_colors(buffer), False)
+            with redirect_stdout(buffer):
+                self.assertEqual(repair.http_status_label(200), "[200]")
+        finally:
+            repair._COLOR_SUPPORT.pop(id(buffer), None)
 
 if __name__ == "__main__":
     unittest.main()

@@ -311,26 +311,72 @@ manifest_hash[16]
 u32 info
 ```
 
-The `info` field is retained in `ManifestAsset`. Current U43/U44 evidence establishes:
+The `info` field is retained in `ManifestAsset`. Current U43 evidence establishes:
 
 ```text
-bits  0..27  -> exact CDN object size in bytes
-bits 28..31  -> separate per-entry metadata
+bits  0..28  -> exact CDN object size in bytes
+bit      29  -> H-cache participation
+bit      30  -> B-cache participation
+bit      31  -> F-cache participation
 ```
 
-The 28-bit size boundary is evidence-backed rather than inferred from small files. A real U44
-`Packages.bin` CDN object is 22,081,406 bytes and carries `info = 0x2150EF7E`; masking with
-`0x0FFFFFFF` yields exactly 22,081,406. An independent U43 `Packages.bin` above 16 MiB follows
-the same layout. The earlier 24-bit-size/high-8-bit-flags interpretation was therefore incomplete.
+The 29-bit size boundary is directly proven by the supplied U43 data.
+`/Lotus/Videos/ShrinesIntro.bk2` carries `info = 0xB0466F76`. Its matching pre-U43
+`H.VideoTexture` payload is 134 bytes and its `F.VideoTexture` payload is 273,051,336 bytes.
+For the directly comparable raw H+F VideoTexture objects, the CDN container is the H payload plus
+the F payload plus 40 bytes of framing. Therefore the expected object size is:
 
-The upper nibble is preserved but is not required for repair/download-size correctness. Research
-evidence strongly associates three of those bits with H/B/F cache participation, while bit 28
-remains intentionally unnamed until matching-build evidence proves its meaning. Do not make the
-download planner depend on that unresolved flag.
+```text
+134 + 273,051,336 + 40 = 273,051,510 = 0x10466F76
+```
+
+Masking the manifest value with `0x1FFFFFFF` yields that exact value. Masking with the former
+`0x0FFFFFFF` drops exactly `0x10000000` (256 MiB) and incorrectly reports 4,616,054 bytes.
+This proves that bit 28 is the high size bit, not a fourth metadata flag. The earlier >16 MiB
+`Packages.bin` fixtures proved only that the old 24-bit interpretation was too small; they did not
+distinguish a 28-bit field from a 29-bit field.
+
+The three remaining high bits correlate extremely strongly against the complete pre-U43 Steam
+base: bit 29 with H participation, bit 30 with B participation, and bit 31 with F participation.
+The hash-confirmed U43 classes are therefore represented by high-three-bit combinations for H,
+H+B, H+F and H+B+F while bit 28 remains part of the byte size. The repairer currently needs only
+the 29-bit size for download planning, so the H/B/F flag bits remain preserved in raw `info`
+without becoming repair dependencies.
+
+### U43 research fixture details
+
+The U43 study used **19 final-U43 v14 B.Cache manifests containing 482,714 entries** and a
+pre-U43 Steam `Cache.Windows` set with **95 H/B/F TOCs**. All 95 referenced cache files were
+present and every live TOC range stayed within the corresponding file. Namespace+path indexing
+of that base produced:
+
+```text
+H          482,346
+B          367,710
+F          222,434
+
+H only      89,968
+H+B        169,944
+H+F         24,668
+H+B+F      197,766
+```
+
+In that particular base, every B entry and every F entry was also present in H. This made the
+four H/H+B/H+F/H+B+F classes especially useful for identifying the three high manifest bits.
+There is an important provenance caveat: these TOCs belong to the **pre-U43 Steam base**, not to
+the final U43 target. Path-only membership is therefore structural/correlative evidence rather
+than direct target-side proof. The stronger confirmation comes from entries whose decoded H hash
+exactly matches the final-U43 manifest hash; the H/B/F bit mapping remains consistent on that
+hash-confirmed unchanged subset.
+
+The research helper intentionally remains separate from the repair path. It can scan the entire
+cache set, emit large CSVs, compare unrelated builds and inspect experimental correlations without
+turning those diagnostics into production dependencies. Proven format facts are folded back into
+this document and, where useful to repair correctness, into `warframe_patch_repair.py`.
 
 Before asset downloading, the repairer preflights selected manifest candidates using the same
 local-object/type evidence rules needed to decide whether a CDN fetch is actually necessary. It
-sums `info & 0x0FFFFFFF` only for objects that still need the CDN. Final non-mutating preflight
+sums `info & 0x1FFFFFFF` only for objects that still need the CDN. Final non-mutating preflight
 outcomes (for example, an already-valid local object or an unresolved type) are cached and reused
 by the result pass so the same local bytes are not immediately read and verified again. Cases that
 still require a copy, repair, or write are deliberately not cached as final results. The resulting
@@ -345,10 +391,13 @@ memory pressure; 2 remains the compatibility-oriented default.
 thread. One global row reports committed + active bytes, smoothed aggregate wire speed, ETA and
 completed-file count. The worker count is already printed once by the download plan, so the
 transient row deliberately does not append changing active-worker counts or filenames; this keeps
-the status width steadier and avoids duplicating information. The row stays transient at the bottom
-of the console: whenever an asset finishes, its permanent result line is printed above it and the
-aggregate row is immediately redrawn below. Retry/warning messages use the same locked message
-scope. Planned download results are therefore visible live and are not printed a second time during
+the status width steadier and avoids duplicating information. The CDN work list is sorted by
+case-insensitive logical CDN path before scheduling. Workers still finish independently, but the
+main thread buffers their small result tuples by sorted index and emits contiguous completed
+results in order. A slow earlier file may briefly delay later permanent log rows; the workers and
+aggregate progress are not blocked. The row stays transient at the bottom of the console and is
+redrawn after each ordered result batch. Retry/warning messages use the same locked message scope.
+Planned download results are displayed during downloading and are not printed again during
 the later result-accounting pass. Per-file verification and saving rows are suppressed while this
 aggregate row is active so concurrent workers cannot fight for the same terminal line. Retry
 attempts remove only that worker's provisional completion so another active transfer is not
@@ -657,7 +706,15 @@ Conceptually this includes:
 `cache_offset == -1` means the entry defines a directory node.
 
 `timestamp == 0` is skipped as a deleted/duplicate style TOC entry, matching the behavior the
-repair work derived from LotusLib references.
+repair work derived from LotusLib references. Live file entries must also have non-negative cache
+offsets, compressed lengths and decompressed lengths. This validation happens before any cache
+payload read so a malformed signed length such as `-1` cannot accidentally turn into an
+unbounded `read(-1)` of the remaining archive.
+
+`read_cache_entry_raw()` also checks each live entry against the actual backing `.cache` file
+size before reading. An offset beyond EOF or a positive compressed range extending past EOF is
+rejected immediately rather than issuing a potentially very large read and discovering the
+short result afterwards.
 
 ## 8.3 Base namespace mapping from H package names
 
@@ -678,49 +735,53 @@ This makes base comparison namespace-aware. The same logical path in `0_de` cann
 
 ## 8.4 Cache entry decompression
 
-An entry can be:
+For the modern base-cache format exercised by the U44 repair validation, an entry can be:
 
-- stored raw when compressed length equals decompressed length;
-- framed into Warframe blocks;
-- Oodle-compressed;
-- decoded through the custom LZ/LZF-compatible fallback used by the cache reader.
-
-For framed blocks, the current block header decoder expects the Warframe-style 8-byte header.
+- stored raw when the entry or framed block has equal compressed/decompressed sizes;
+- framed into Warframe blocks using the observed 8-byte block header;
+- Oodle-compressed, identified by the observed `0x8C` compressed-block marker.
 
 A critical observed rule is:
 
 > If a framed block advertises equal compressed and decompressed sizes, treat the block as raw
-> stored data rather than sending it into the LZF/Oodle decompression paths.
+> stored data rather than sending it into Oodle decompression.
 
-Without this distinction valid cache entries can fail decompression.
+Without this distinction valid cache entries can fail decompression. Compressed blocks that are
+neither raw/stored nor the tested Oodle form now fail closed as unsupported instead of being
+guessed as another codec.
 
-### LZF/LZ compatibility note
+### Legacy LZ/LZF note
 
-The repairer retains `lzf_decompress()` because existing Warframe cache tooling and community
-documentation describe Cache.Windows data containing both Oodle and a custom LZ/LZF-style
-encoding. The repairer therefore treats compression as a property of the individual block, not
-as something inferred from a Warframe version or historical era.
+Older Warframe Cache.Windows data did use LZ/LZF-compatible compression; the retained U11.1.3
+font-fix research is a concrete legacy example. That does **not** make LZ/LZF part of the modern
+repairer's supported cache format.
 
-Do **not** assign a historical cutoff to this branch from secondary documentation. Community
-cache tools and notes describe Oodle and custom LZ/LZF-style blocks, but their historical
-timelines are not treated as authoritative engine-history facts. The repairer therefore makes no
-claim here about the exact Warframe update or year in which compression behavior changed.
+To settle whether the fallback was still needed for the modern repair path, the original, unupdated
+Steam base used for the U44 repair validation was scanned exhaustively through every live
+TOC-addressable entry:
 
-Our U44 repair fixtures establish that the current base-cache reader works for the tested modern
-repair cases and exercise raw/Oodle handling. They do **not** currently establish that U44 itself
-requires the LZF fallback, nor do they establish when Warframe introduced, retired, or changed
-its LZ encoding. Older Warframe cache formats changed more than once, so historical-version work
-should be validated against real fixtures instead of assigning a format to a year or named update.
+```text
+Archives scanned      : 95
+Entries scanned       : 1,089,950
+Blocks classified     : 1,592,680
+Raw/stored            : 267,860
+`0x8C` Oodle-classified: 1,324,820
+LZ/LZF-compatible     : 0
+Unknown compressed    : 0
+Scan errors           : 0
+Entry bytes           : 51.3 GiB stored / 123.4 GiB logical
+```
 
-Keep the fallback while it remains small and compatible. It can be removed later only if real
-fixtures for the supported version range show that it is unnecessary.
+The scanner identified Oodle-classified blocks by the observed `0x8C` marker rather than loading Oodle merely to prove codec identity for every block. The important result for this decision was that every non-raw, non-`0x8C` compressed block was tested as a possible LZ/LZF stream and the exhaustive scan found **0 LZ/LZF-compatible**, **0 unknown**, and **0 scan errors**.
 
-Reference context (community/research material, not authoritative format specifications):
+That real-format evidence is why the legacy `lzf_decompress()` fallback was removed. The modern
+reader now accepts the raw/`0x8C` Oodle-classified forms observed in that tested base and reports an
+unsupported-compression error for anything else. This is deliberately narrower and safer than
+treating every non-`0x8C` compressed block as LZF.
 
-- Puxtril/LotusLib cache/decompression notes:
-  https://github.com/Puxtril/LotusLib
-- PKBeam/Warframe-Game-File-Docs cache notes:
-  https://github.com/PKBeam/Warframe-Game-File-Docs
+This does **not** claim an exact historical update at which Warframe stopped using LZ/LZF. Older
+cache work should continue to use real fixtures and format-specific tooling rather than assuming
+the modern U44 reader applies to historical builds.
 
 ## 8.5 CommonHeader information
 
@@ -753,7 +814,28 @@ later type metadata unreadable -> lose the optional type hint only
 ```
 
 This prevents a type-parser limitation from incorrectly converting a clearly unchanged or
-changed asset into an unknown asset.
+changed asset into an unknown asset. U43 research also showed that some readable H-cache payloads
+are intentionally not standard CommonHeaders at all: service payloads and a large MissionDeck /
+DropTable-style `16*n+1` family still expose the leading hash but no normal CommonHeader type
+field. The production repairer therefore reports their type metadata as unavailable rather than
+loosening the CommonHeader grammar to accept unrelated layouts.
+
+The full U43 cache pass found **1,958** readable H payloads without normal CommonHeader type
+metadata:
+
+```text
+opaque 16*n+1 payloads     1,936
+service payloads              17
+other non-CommonHeader         5
+```
+
+Of those, **1,934** had a base hash identical to the final-U43 target and therefore needed no
+target type for delta repair. The remaining **24** were changed, and all 24 had an exact target
+type independently visible in a captured final-U43 CDN/OpenWF object filename. Thus this fixture
+contained no changed repair candidate whose success depended on forcing one of these special H
+payloads through the CommonHeader type parser. This is useful evidence for keeping hash extraction
+and type extraction separate, and for preferring an explicit unavailable type hint over a
+permissive parser that could misclassify unrelated payload formats.
 
 ---
 
@@ -1688,8 +1770,11 @@ full path <= 32760 UTF-16 code units
 The purpose is to catch impossible output names while still permitting long-path-capable
 Windows configurations.
 
-Generated CDN paths are also checked against traversal/unsafe components such as empty,
-`.` or `..` path segments.
+Generated CDN paths are validated in their raw slash-separated form before `pathlib` can
+normalize segments away. Empty, `.` and `..` components are rejected, as are backslashes and
+colon-bearing components. The latter prevents Windows drive/root reinterpretation and NTFS
+alternate-data-stream syntax from redirecting a generated CDN name outside its intended
+`OpenWF/Content` hierarchy.
 
 ---
 
@@ -2036,7 +2121,7 @@ Tests that exercise transient progress directly capture the repairer's stdout. T
 
 The documented commands use `-B`, so running the suite does not create `.pyc`/`__pycache__` files. Repository hygiene is intentionally small: `.gitignore` still excludes Python cache/test-environment artifacts, and `.gitattributes` normalizes text source/docs to LF while marking bundled binaries/archives as binary. Do not broaden the ignore list to captured logs, fixtures, or Warframe research data without a concrete reason; those may be intentional inputs.
 
-The focused suite currently contains 72 tests and covers the failure modes most likely to
+The focused suite currently contains 76 tests and covers the failure modes most likely to
 create a misleading future repair result:
 
 - H.Cache origin URL/type selection, structural parsing and embedded self-hash verification;
@@ -2058,10 +2143,10 @@ create a misleading future repair result:
 - manifest version 14 is accepted while unsupported versions are fatal and propagate out of manifest collection;
 - manifest truncation and unexplained trailing decoded-manifest bytes are rejected;
 - a sanitized real U44.0.2 `B.Cache.Windows_de.bin` header validates the real v14 section/path layout;
-- real manifest `info` metadata is retained and a >16 MiB `0x2150EF7E` fixture proves the 28-bit CDN-size mask;
-- manifest CDN planning returns the exact objects that still require a download, sums their 28-bit manifest sizes and excludes already-valid local objects;
+- real manifest `info` metadata is retained and the U43 `ShrinesIntro.bk2` fixture proves the 29-bit CDN-size mask across the 256 MiB boundary;
+- manifest CDN planning returns the exact objects that still require a download, sums their 29-bit manifest sizes and excludes already-valid local objects;
 - the default two-worker manifest downloader actually overlaps two worker threads, while worker count 1 stays on the sequential path and `-w` forwards an explicit worker count;
-- completed planned downloads are emitted immediately as permanent rows while the aggregate progress row is restored below them;
+- parallel planned download results are emitted in logical-path order as soon as all earlier rows are ready, while the aggregate progress remains independent;
 - verified non-download preflight results can be reused by the result pass instead of immediately re-reading the same local object;
 - manifest type fallback priority is centralized so preflight and the actual repair path cannot drift;
 - global download progress tracks simultaneous per-worker attempts, rolls failed retry bytes back from completion, suppresses per-file verification rows while active and adjusts the planned total when a verified response size differs;
@@ -2078,11 +2163,14 @@ create a misleading future repair result:
 - direct SHCC CRC32C success/failure and embedded target-hash mismatch behavior are exercised;
 - the observed outer `0x43` whole-object wrapper is exercised for valid and corrupted CRC32C cases;
 - Oodle chunk payloads with unexplained trailing bytes are rejected;
-- malformed/truncated LZF streams, invalid back-references, and decompressed-size mismatches are rejected;
-- equal-sized framed Cache.Windows blocks are copied raw without invoking Oodle/LZF;
+- compressed Cache.Windows blocks outside the tested raw/Oodle forms fail closed as unsupported;
+- equal-sized framed Cache.Windows blocks are copied raw without invoking Oodle;
 - atomic writes retry synthetic disk-full failures during temporary-file creation and replacement while preserving the old destination until replacement succeeds and cleaning temporary files;
 - OpenWF exact 404 recovery is scoped to the latest `Using log file:` session boundary, while a log with no marker contributes no recovery objects;
-- Packages and Cache.Windows directory-enumeration errors are preserved instead of being misreported as missing data.
+- Packages and Cache.Windows directory-enumeration errors are preserved instead of being misreported as missing data;
+- generated CDN output paths reject Windows drive/ADS/backslash syntax plus empty/`.`/`..` segments before joining;
+- live Cache.Windows TOC entries with negative offsets or compressed/decompressed lengths are rejected before cache payload reads;
+- cache-entry offsets/ranges beyond the actual backing `.cache` file are rejected before reading.
 
 These focused tests do not replace real Warframe fixtures. The broader matrix should continue
 to distinguish synthetic unit coverage from retained real-format evidence.
@@ -2208,7 +2296,6 @@ repair_object
 iter_toc_entries
 find_cache_windows_dir
 _warframe_block_lens
-lzf_decompress
 read_cache_entry_raw
 decompress_cache_entry
 parse_common_header
@@ -2362,7 +2449,7 @@ actually trust.
 # 39. Relationship to Ninja Capture Tool / Ninja Patch Tool
 
 This is a standalone repair script for Ninja Capture Tool/OpenWF captures. Its original
-validation set was created with NCT v1.0-era captures; NCT v1.1 is intended to integrate this
+validation set was created with NCT v1.0-era captures; NCT v2.0 is intended to integrate this
 repair workflow directly because it already knows more about the capture session and can invoke
 repair at the appropriate point.
 
@@ -2410,3 +2497,54 @@ adding emulator instructions or heuristics. A raw extractor failure should remai
 behavior unless real evidence establishes the new pattern. Do not replace target-build extraction
 with a hard-coded U44 type table merely because that would be simpler.
 
+
+---
+
+# 41. Cancellation, console reporting and optional base identity (October 2026)
+
+## 41.1 Cooperative Ctrl+C in the two-worker download pipeline
+
+`repair_planned_manifest_downloads()` now wraps each worker in a thread-local context
+containing a shared `threading.Event` plus the existing aggregate progress instance.
+The main thread catches `KeyboardInterrupt`, sets the event, cancels futures not yet
+started, then lets the executor join the (at most `-w`) active worker operations.
+The outer CLI preserves exit status **130**. A download worker checks cancellation
+before work and between attempts. The libcurl transfer callback (`XFERINFOFUNCTION`)
+returns nonzero when interrupted; header/body callbacks are cancellation-aware too.
+The normal retry sleep uses `Event.wait()` so Ctrl+C does not wait for a retry delay.
+
+Disk-space waits, directory creation, temporary-file writes and atomic replacement
+check the worker cancellation event. Interrupted writes retain the previous destination
+and remove `.wfpr-*.tmp` files. Native SHCC verification or an OS syscall may need
+to finish before the next check. Non-download operations preserve their existing
+main-thread Ctrl+C behavior.
+
+## 41.2 Console output
+
+Final successful/failed CDN object rows still emit in deterministic asset-path order,
+independently of the two workers' completion order. Immediate diagnostic messages
+(e.g. retries, invalid existing objects and disk warnings) use the existing
+`OverallDownloadProgress.message_scope()` lock to avoid overlapping the live progress
+row. A download worker waiting for space emits one `[Waiting]` line and one `[Resumed]`
+line when space is available. The main-thread/non-worker transient wait behavior remains.
+The fast post-download candidate-reduction stage no longer prints misleading
+thousands-of-objects-per-second `[Completion] Processing ...` rows. The final summary
+preserves all completion counters and diagnostics.
+
+## 41.3 Optional original-base H.TOC fingerprint
+
+A deterministic SHA-256 over the sorted base `H.*.toc` filenames, sizes and bytes is
+printed in normal repair mode. After independently verifying an original Steam base,
+the user can pin that value with `--base-fingerprint <SHA256>` on later runs. A mismatch
+raises `RepairError` **before any patch-content modifications**. No sidecar file is
+written into the original base, and no hard-coded U44 depot identity is assumed.
+This fingerprint proves only equality of the indexed H.TOC metadata, **not** the
+integrity or authenticity of `H.*.cache` payloads, a Steam manifest, or the complete
+base game. Without a pinned expected value there is no authoritative comparison.
+
+## 41.4 Regression tests
+
+New tests cover stable/change-sensitive TOC fingerprinting, fail-fast mismatch,
+CLI validation, synchronized disk wait/resume, cancelable disk waits, atomic-write
+preservation, queued and active worker cancellation, in-flight libcurl callback abort,
+and redirected-stream ANSI output. The focused suite now contains **85 tests**.

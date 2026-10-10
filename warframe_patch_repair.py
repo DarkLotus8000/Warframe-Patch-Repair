@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.parse
 from collections import Counter, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -55,8 +55,7 @@ OODLE_DLL_NAME = "oo2core_9.dll"
 OODLE_X64_SHA256 = "19452ae1abae65e1305d3818354d4fae7b1200294322f0d9c6d5ddeb7bd9f978"
 OODLE_X64_SIZE = 582656
 SUPPORTED_MANIFEST_VERSION = 14
-MANIFEST_INFO_SIZE_MASK = 0x0FFFFFFF
-MANIFEST_INFO_FLAGS_SHIFT = 28
+MANIFEST_INFO_SIZE_MASK = 0x1FFFFFFF
 DOWNLOAD_SPEED_WINDOW_SECONDS = 8.0
 DOWNLOAD_ETA_MIN_SAMPLE_SECONDS = 1.0
 DEFAULT_DOWNLOAD_WORKERS = 2
@@ -69,6 +68,8 @@ _WINDOWS_MAX_COMPONENT_UTF16 = 255
 _WINDOWS_MAX_PATH_UTF16 = 32760
 _LOW_DISK_WARNED: set[str] = set()
 _CURL_LOCAL = threading.local()
+_WORKER_CONTEXT = threading.local()
+_DISK_WARN_LOCK = threading.Lock()
 
 ANSI_GREEN = "\x1b[92m"
 ANSI_YELLOW = "\x1b[93m"
@@ -82,14 +83,14 @@ ManifestAssetKey = tuple[str, str, str]
 ManifestRepairResult = tuple[str, str | None, str | None, int | None]
 
 def _enable_console_colors(stream) -> bool:
+    # Check the live stream first: short-lived redirected StringIO streams can
+    # reuse an id previously cached for a TTY (notably during unit tests).
+    if not getattr(stream, "isatty", lambda: False)() or os.environ.get("NO_COLOR") is not None:
+        return False
     key = id(stream)
     cached = _COLOR_SUPPORT.get(key)
     if cached is not None:
         return cached
-
-    if not getattr(stream, "isatty", lambda: False)() or os.environ.get("NO_COLOR") is not None:
-        _COLOR_SUPPORT[key] = False
-        return False
     if os.name != "nt":
         _COLOR_SUPPORT[key] = True
         return True
@@ -220,15 +221,50 @@ def _disk_volume_key(path: Path) -> str:
     except OSError:
         return str(path.resolve())
 
+def _check_cancelled() -> None:
+    event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+    if event is not None and event.is_set():
+        raise CancelledError("Download cancelled by user")
+
+@contextmanager
+def _download_worker_context(
+    cancel_event: threading.Event, progress: OverallDownloadProgress
+):
+    # Only download workers use this context; unrelated repair operations keep
+    # their original console/progress and disk-space behavior.
+    _WORKER_CONTEXT.cancel_event = cancel_event
+    _WORKER_CONTEXT.progress = progress
+    try:
+        yield
+    finally:
+        del _WORKER_CONTEXT.cancel_event
+        del _WORKER_CONTEXT.progress
+
+def _worker_message(message: str, *, warning: bool = False) -> None:
+    progress = getattr(_WORKER_CONTEXT, "progress", None)
+    if progress is None:
+        if warning:
+            print_warning(message)
+        else:
+            print(message, flush=True)
+        return
+    with progress.message_scope():
+        if warning:
+            print_warning(message)
+        else:
+            print(message, flush=True)
+
 def _warn_low_disk_space(path: Path, free: int) -> None:
     if free > DISK_LOW_WARNING_BYTES:
         return
     key = _disk_volume_key(path)
-    if key in _LOW_DISK_WARNED:
-        return
-    _LOW_DISK_WARNED.add(key)
-    print_warning(
-        f"Only {_format_bytes(free)} of free space remains on the output drive ({path.anchor or path})."
+    with _DISK_WARN_LOCK:
+        if key in _LOW_DISK_WARNED:
+            return
+        _LOW_DISK_WARNED.add(key)
+    _worker_message(
+        f"Only {_format_bytes(free)} of free space remains on the output drive ({path.anchor or path}).",
+        warning=True,
     )
 
 def _is_disk_full_error(exc: OSError) -> bool:
@@ -248,8 +284,10 @@ def _wait_for_disk_space(
     needed = required_bytes + DISK_SAFETY_HEADROOM_BYTES
     line = TransientLine(min_interval=0.20)
     waiting = False
+    worker_progress = getattr(_WORKER_CONTEXT, "progress", None)
     try:
         while True:
+            _check_cancelled()
             anchor = _existing_disk_anchor(path)
             usage = shutil.disk_usage(anchor)
             free = int(usage.free)
@@ -261,9 +299,21 @@ def _wait_for_disk_space(
                     f"but the volume capacity is only {_format_bytes(int(usage.total))}."
                 )
             if free >= needed:
+                if waiting and worker_progress is not None:
+                    _worker_message(f"[Resumed] Disk space available | {display_name}")
                 return
 
+            if not waiting and worker_progress is not None:
+                _worker_message(
+                    f"[Waiting] {_format_bytes(needed)} needed / {_format_bytes(free)} available "
+                    f"| Free disk space to continue | {display_name}"
+                )
             waiting = True
+            if worker_progress is not None:
+                event = _WORKER_CONTEXT.cancel_event
+                if event.wait(DISK_WAIT_INTERVAL_SECONDS):
+                    _check_cancelled()
+                continue
             plain_prefix = (
                 f"[Waiting] {_format_bytes(needed)} needed / {_format_bytes(free)} available "
                 f"| Free disk space to continue | "
@@ -286,6 +336,7 @@ def _wait_for_disk_space(
 def _ensure_directory_with_disk_wait(path: Path, display_name: str) -> None:
     _validate_windows_output_path(path, label="Output directory")
     while True:
+        _check_cancelled()
         try:
             path.mkdir(parents=True, exist_ok=True)
             return
@@ -532,7 +583,7 @@ class OverallDownloadProgress:
         self.completed = 0
         self.files_completed = 0
         self.wire_bytes = 0
-        self._active: dict[int, tuple[str, int, int]] = {}
+        self._active: dict[int, tuple[int, int]] = {}
         self._lock = threading.RLock()
         now = time.monotonic()
         self.samples: deque[tuple[float, int]] = deque([(now, 0)])
@@ -558,7 +609,7 @@ class OverallDownloadProgress:
             return
         now = time.monotonic()
         speed = self._speed(now)
-        active_bytes = sum(active for _name, _planned, active in self._active.values())
+        active_bytes = sum(active for _planned, active in self._active.values())
         current = self.completed + active_bytes
         if self.total:
             current = min(self.total, current)
@@ -614,10 +665,9 @@ class OverallDownloadProgress:
 
         self.line.render(styled_prefix, plain_prefix, force=force)
 
-    def start_attempt(self, name: str, planned_size: int | None) -> None:
+    def start_attempt(self, planned_size: int | None) -> None:
         with self._lock:
             self._active[threading.get_ident()] = (
-                name,
                 max(0, int(planned_size or 0)),
                 0,
             )
@@ -629,9 +679,9 @@ class OverallDownloadProgress:
             active = self._active.get(thread_id)
             if active is None:
                 return
-            name, planned, current = active
+            planned, current = active
             amount = max(0, int(amount))
-            self._active[thread_id] = (name, planned, current + amount)
+            self._active[thread_id] = (planned, current + amount)
             self.wire_bytes += amount
             self._render(force=force)
 
@@ -640,7 +690,7 @@ class OverallDownloadProgress:
             active = self._active.pop(threading.get_ident(), None)
             if active is None:
                 return
-            _name, planned_size, _current = active
+            planned_size, _current = active
             actual_size = max(0, int(actual_size))
             if planned_size != actual_size:
                 self.total = max(0, self.total + actual_size - planned_size)
@@ -1723,7 +1773,7 @@ def b64m_encode(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii").rstrip("=").replace("/", "-")
 
 def cache_name(
-    path: str, type_id: int, b64m_hash: str, namespace: str = "0"
+    path: str, type_id: int, b64m_hash: str, namespace: str
 ) -> str:
     return f"{namespace}{path}!{type_id:X}_{b64m_hash}"
 
@@ -1733,11 +1783,17 @@ def cdn_url(name: str) -> str:
     return CDN_BASE + urllib.parse.quote(name, safe="/!_-.,~")
 
 def local_path(root: Path, name: str) -> Path:
-    posix = PurePosixPath(name)
-    if posix.is_absolute() or any(part in {"", ".", ".."} for part in posix.parts):
+    # Validate the raw slash-separated form before pathlib can normalize away
+    # empty or "." segments. Backslashes and colons have Windows drive/root or
+    # alternate-data-stream semantics and are never valid CDN path separators.
+    parts = name.split("/")
+    if (
+        "\\" in name
+        or any(part in {"", ".", ".."} or ":" in part for part in parts)
+    ):
         raise RepairError(f"Unsafe CDN path generated: {name}")
     return _validate_windows_output_path(
-        root.joinpath(*posix.parts),
+        root.joinpath(*parts),
         label="Output asset path",
     )
 
@@ -2054,8 +2110,9 @@ def parse_manifest_header(header: bytes):
     # U44 Cache.bin/B.Cache manifest structure:
     #   embedded object hash[16], u32 version, then service/packed/stripped sections.
     # Every entry stores path, 16-byte target hash and a packed u32. Real U43/U44
-    # CDN objects, including >16 MiB Packages.bin objects, establish that the low
-    # 28 bits are the exact CDN byte size. The high nibble is separate metadata.
+    # U43/U44 evidence establishes that bits 0..28 are the exact CDN byte size.
+    # U43 ShrinesIntro.bk2 crosses 256 MiB and directly proves size bit 28; the
+    # remaining high bits 29/30/31 correlate with H/B/F cache participation.
     #
     # All 38 directly decompressed U44.0.1/U44.0.2 manifests use version 14.
     # Treat a different value as a compatibility boundary instead of attempting
@@ -2275,6 +2332,7 @@ def _download_official_h_cache(
     last_status: int | None = None
 
     for attempt in range(1, HTTP_ATTEMPTS + 1):
+        _check_cancelled()
         try:
             body, status = _curl_download_bytes(
                 url,
@@ -2619,6 +2677,7 @@ def _curl_download_bytes(
     overall_progress: OverallDownloadProgress | None = None,
     planned_size: int | None = None,
 ) -> tuple[bytearray, int]:
+    _check_cancelled()
     pycurl = _require_pycurl()
     curl = _curl_for_thread()
     curl.reset()
@@ -2629,10 +2688,13 @@ def _curl_download_bytes(
     callback_error: OSError | None = None
     progress: DownloadProgress | None = None
     if overall_progress is not None:
-        overall_progress.start_attempt(display_name, planned_size)
+        overall_progress.start_attempt(planned_size)
 
     def header_callback(raw: bytes) -> int:
         nonlocal response_status, expected_size, callback_error
+        event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+        if event is not None and event.is_set():
+            return 0
         line = raw.strip()
         status_match = _HTTP_STATUS_LINE_RE.match(line)
         if status_match is not None:
@@ -2663,6 +2725,9 @@ def _curl_download_bytes(
 
     def write_callback(chunk: bytes) -> int:
         nonlocal progress, callback_error
+        event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+        if event is not None and event.is_set():
+            return 0
         # Redirect/error response bodies are irrelevant to object verification and
         # must not distort aggregate CDN progress.
         if response_status != 200:
@@ -2698,10 +2763,20 @@ def _curl_download_bytes(
     curl.setopt(pycurl.SSL_VERIFYHOST, 2)
     curl.setopt(pycurl.HEADERFUNCTION, header_callback)
     curl.setopt(pycurl.WRITEFUNCTION, write_callback)
+    event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+    if event is not None:
+        curl.setopt(pycurl.NOPROGRESS, 0)
+        curl.setopt(
+            pycurl.XFERINFOFUNCTION,
+            lambda _download_total, _download_now, _upload_total, _upload_now: int(
+                event.is_set()
+            ),
+        )
 
     try:
         curl.perform()
     except pycurl.error as exc:
+        _check_cancelled()
         if callback_error is not None:
             raise callback_error from exc
         raise OSError(f"libcurl: {_curl_error_text(exc)}") from exc
@@ -2712,6 +2787,7 @@ def _curl_download_bytes(
             progress.update(0, force=True)
             progress.finish()
 
+    _check_cancelled()
     if callback_error is not None:
         raise callback_error
 
@@ -2735,6 +2811,7 @@ def download_asset(
     last_status: int | None = None
 
     for attempt in range(1, HTTP_ATTEMPTS + 1):
+        _check_cancelled()
         try:
             body, status = _curl_download_bytes(
                 url,
@@ -2802,7 +2879,12 @@ def download_asset(
                     print_retry(attempt + 1, last_error or "unknown download error", display_name)
             else:
                 print_retry(attempt + 1, last_error or "unknown download error", display_name)
-            time.sleep(0.5 * attempt)
+            event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+            if event is not None:
+                if event.wait(0.5 * attempt):
+                    _check_cancelled()
+            else:
+                time.sleep(0.5 * attempt)
 
     return None, last_error or "unknown download error", last_status
 
@@ -2825,6 +2907,7 @@ def atomic_write(
     _wait_for_disk_space(path.parent, len(data), display)
 
     while True:
+        _check_cancelled()
         temporary: Path | None = None
         progress: DownloadProgress | None = None
         try:
@@ -2869,6 +2952,7 @@ def atomic_write(
                 with os.fdopen(fd, "wb") as handle:
                     view = memoryview(data)
                     for offset in range(0, len(view), 1024 * 1024):
+                        _check_cancelled()
                         chunk = view[offset:offset + 1024 * 1024]
                         written = handle.write(chunk)
                         if written != len(chunk):
@@ -2890,6 +2974,7 @@ def atomic_write(
                 progress.update(0, force=True)
 
             while True:
+                _check_cancelled()
                 try:
                     os.replace(temporary, path)
                     temporary = None
@@ -2950,12 +3035,12 @@ class ManifestAsset:
         return b64m_encode(self.manifest_hash)
 
     @property
-    def cdn_size(self) -> int:
-        return self.info & MANIFEST_INFO_SIZE_MASK
+    def key(self) -> ManifestAssetKey:
+        return self.namespace, self.logical_path, self.hash_b64
 
     @property
-    def cache_flags(self) -> int:
-        return self.info >> MANIFEST_INFO_FLAGS_SHIFT
+    def cdn_size(self) -> int:
+        return self.info & MANIFEST_INFO_SIZE_MASK
 
 def _decode_toc_name(raw: bytes) -> str:
     raw = raw.split(b"\0", 1)[0]
@@ -3015,6 +3100,22 @@ def iter_toc_entries(toc_path: Path):
             # LotusLib treats this as a deleted/duplicate TOC entry.
             continue
 
+        if cache_offset < 0:
+            raise RepairError(
+                f"Invalid negative cache offset {cache_offset} for {logical_path} "
+                f"in {toc_path.name}"
+            )
+        if compressed_len < 0:
+            raise RepairError(
+                f"Invalid negative compressed length {compressed_len} for {logical_path} "
+                f"in {toc_path.name}"
+            )
+        if length < 0:
+            raise RepairError(
+                f"Invalid negative decompressed length {length} for {logical_path} "
+                f"in {toc_path.name}"
+            )
+
         yield CacheEntry(
             cache_path=cache_path,
             logical_path=logical_path,
@@ -3055,59 +3156,19 @@ def _warframe_block_lens(data: bytes, offset: int) -> tuple[int, int]:
     decompressed_len = (num2 >> 5) & 0xFFFFFF
     return compressed_len, decompressed_len
 
-def lzf_decompress(data: bytes, expected_size: int) -> bytes:
-    output = bytearray()
-    i = 0
-
-    while i < len(data):
-        control = data[i]
-        i += 1
-
-        if control < 32:
-            literal_len = control + 1
-            if i + literal_len > len(data):
-                raise RepairError("Truncated LZF literal run.")
-            output.extend(data[i:i + literal_len])
-            i += literal_len
-            continue
-
-        length = control >> 5
-        reference_offset = (control & 0x1F) << 8
-
-        if length == 7:
-            if i >= len(data):
-                raise RepairError("Truncated LZF length.")
-            length += data[i]
-            i += 1
-
-        if i >= len(data):
-            raise RepairError("Truncated LZF back-reference.")
-        reference_offset += data[i]
-        i += 1
-
-        reference = len(output) - reference_offset - 1
-        if reference < 0:
-            raise RepairError("Invalid LZF back-reference.")
-
-        length += 2
-        for _ in range(length):
-            if reference < 0 or reference >= len(output):
-                raise RepairError("Invalid LZF copy range.")
-            output.append(output[reference])
-            reference += 1
-
-    if len(output) != expected_size:
-        raise RepairError(
-            f"LZF produced {len(output)} bytes; expected {expected_size}."
-        )
-    return bytes(output)
-
 def read_cache_entry_raw(entry: CacheEntry) -> bytes:
     if not entry.cache_path.is_file():
         raise RepairError(f"Matching cache file is missing: {entry.cache_path}")
 
     try:
         with entry.cache_path.open("rb") as file:
+            cache_size = os.fstat(file.fileno()).st_size
+            if entry.offset > cache_size or entry.compressed_len > cache_size - entry.offset:
+                raise RepairError(
+                    f"Cache.Windows entry exceeds cache file bounds for {entry.logical_path}: "
+                    f"offset {entry.offset}, compressed length {entry.compressed_len}, "
+                    f"cache size {cache_size}: {entry.cache_path.name}"
+                )
             file.seek(entry.offset)
             data = file.read(entry.compressed_len)
     except OSError as exc:
@@ -3154,10 +3215,11 @@ def decompress_cache_entry(entry: CacheEntry, oodle: Oodle) -> bytes:
         elif block[0] == 0x8C:
             decompressed = oodle.decompress(block, decompressed_len)
         else:
-            # Custom LZ/LZF-compatible fallback retained for cache compatibility.
-            # Do not infer a historical cutoff from this branch; compression
-            # behavior must be established from real fixtures.
-            decompressed = lzf_decompress(block, decompressed_len)
+            raise RepairError(
+                f"Unsupported Cache.Windows compression format for {entry.logical_path}: "
+                f"compressed block starts with 0x{block[0]:02X}; "
+                "the tested modern format is raw/stored or Oodle (0x8C)."
+            )
 
         output.extend(decompressed)
 
@@ -3297,6 +3359,29 @@ def _base_h_toc_files(cache_dir: Path) -> list[Path]:
             f"Could not enumerate base H TOCs in {cache_dir}: {exc}"
         ) from exc
 
+def base_toc_fingerprint(cache_dir: Path) -> str:
+    """SHA-256 of named original-base H TOCs, independent of timestamps or directory."""
+    toc_files = _base_h_toc_files(cache_dir)
+    if not toc_files:
+        raise RepairError(f"No base H TOCs to fingerprint: {cache_dir}")
+    digest = hashlib.sha256()
+    digest.update(b"WFPR H.TOC fingerprint v1\0")
+    for path in toc_files:
+        try:
+            size = path.stat().st_size
+            name = path.name.encode("utf-8")
+            digest.update(struct.pack("<I", len(name)))
+            digest.update(name)
+            digest.update(struct.pack("<Q", size))
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise RepairError(
+                f"Could not fingerprint original-base TOC {path}: {exc}"
+            ) from exc
+    return digest.hexdigest()
+
 class BaseHeaderCache:
     def __init__(
         self,
@@ -3410,7 +3495,7 @@ class BaseHeaderCache:
         total = sum(self.type_hint_errors.values())
         if total:
             print(
-                f"[Base] CommonHeader type hints unavailable for {total} "
+                f"[Base] H-cache type metadata unavailable for {total} readable "
                 f"{_plural(total, 'entry', 'entries')}; hash comparison remained usable."
             )
 
@@ -4022,9 +4107,7 @@ def _existing_exact_object(
     evidence = resolver.patch_evidence
     if evidence is None:
         return None
-    return evidence.exact_objects.get(
-        (asset.namespace, asset.logical_path, asset.hash_b64)
-    )
+    return evidence.exact_objects.get(asset.key)
 
 def resolve_manifest_asset_type(
     asset: ManifestAsset,
@@ -4076,7 +4159,7 @@ def classify_manifest_against_base(
     progress = ActivityProgress("Comparing base", len(assets))
     try:
         for index, asset in enumerate(assets, 1):
-            key = (asset.namespace, asset.logical_path, asset.hash_b64)
+            key = asset.key
             classification = cached.get(key)
             if classification is None:
                 metadata, had_read_error = base_cache.common_header_metadata(
@@ -4327,7 +4410,7 @@ def plan_manifest_downloads(
     progress = ActivityProgress("Planning downloads", len(assets))
     try:
         for index, asset in enumerate(assets, 1):
-            asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
+            asset_key = asset.key
             needs_download, cached_result = _manifest_asset_download_preflight(
                 asset,
                 content_root=content_root,
@@ -4411,24 +4494,37 @@ def repair_planned_manifest_downloads(
     overall_progress: OverallDownloadProgress,
     workers: int,
 ) -> dict[ManifestAssetKey, ManifestRepairResult]:
+    ordered_assets = sorted(
+        assets,
+        key=lambda asset: (
+            f"{asset.namespace}{asset.logical_path}".casefold(),
+            asset.namespace,
+            asset.logical_path,
+            asset.hash_b64,
+        ),
+    )
+
+    cancel_event = threading.Event()
+
     def repair_one(asset: ManifestAsset):
-        asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
-        return asset_key, repair_manifest_asset(
-            asset,
-            content_root=content_root,
-            source_content_root=source_content_root,
-            oodle=oodle,
-            resolver=resolver,
-            label=label,
-            base_type_hint=base_type_hints.get(
-                (asset.namespace, asset.logical_path)
-            ),
-            base_group_type_hint=base_group_type_hints.get(
-                (_namespace_group(asset.namespace), asset.logical_path)
-            ),
-            openwf_type_hint=openwf_hints.get(asset_key),
-            overall_progress=overall_progress,
-        )
+        with _download_worker_context(cancel_event, overall_progress):
+            _check_cancelled()
+            return asset.key, repair_manifest_asset(
+                asset,
+                content_root=content_root,
+                source_content_root=source_content_root,
+                oodle=oodle,
+                resolver=resolver,
+                label=label,
+                base_type_hint=base_type_hints.get(
+                    (asset.namespace, asset.logical_path)
+                ),
+                base_group_type_hint=base_group_type_hints.get(
+                    (_namespace_group(asset.namespace), asset.logical_path)
+                ),
+                openwf_type_hint=openwf_hints.get(asset.key),
+                overall_progress=overall_progress,
+            )
 
     def report_finished(
         asset: ManifestAsset,
@@ -4439,7 +4535,7 @@ def repair_planned_manifest_downloads(
 
     if workers <= 1 or len(assets) <= 1:
         results = {}
-        for asset in assets:
+        for asset in ordered_assets:
             asset_key, result = repair_one(asset)
             results[asset_key] = result
             report_finished(asset, result)
@@ -4453,12 +4549,28 @@ def repair_planned_manifest_downloads(
         max_workers=min(workers, len(assets)),
         thread_name_prefix="WFPR-CDN",
     ) as executor:
-        futures = {executor.submit(repair_one, asset): asset for asset in assets}
-        for future in as_completed(futures):
-            asset = futures[future]
-            asset_key, result = future.result()
-            results[asset_key] = result
-            report_finished(asset, result)
+        futures = {}
+        try:
+            for index, asset in enumerate(ordered_assets):
+                futures[executor.submit(repair_one, asset)] = index
+            completed: dict[int, ManifestRepairResult] = {}
+            next_to_report = 0
+            for future in as_completed(futures):
+                index = futures[future]
+                asset_key, result = future.result()
+                results[asset_key] = result
+                completed[index] = result
+                while next_to_report in completed:
+                    report_finished(
+                        ordered_assets[next_to_report],
+                        completed.pop(next_to_report),
+                    )
+                    next_to_report += 1
+        except KeyboardInterrupt:
+            cancel_event.set()
+            for future in futures:
+                future.cancel()
+            raise
     return results
 
 def prepare_openwf_404s(
@@ -4501,7 +4613,7 @@ def _select_manifest_sections(
     raise RepairError(f"Unknown manifest section mode: {section_mode}")
 
 def _manifest_object_keys(assets: list[ManifestAsset]) -> set[ManifestAssetKey]:
-    return {(asset.namespace, asset.logical_path, asset.hash_b64) for asset in assets}
+    return {asset.key for asset in assets}
 
 def _filter_openwf_by_section(
     objects: list[str],
@@ -4630,7 +4742,13 @@ def run(
     section_mode: str = "all",
     stripped_output: Path | None = None,
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
+    expected_base_fingerprint: str | None = None,
 ) -> int:
+    if expected_base_fingerprint is not None:
+        if patch_types_only or base_root is None:
+            raise RepairError("Base fingerprint requires normal repair mode.")
+        if re.fullmatch(r"[a-fA-F0-9]{64}", expected_base_fingerprint) is None:
+            raise RepairError("Expected base fingerprint must be exactly 64 hexadecimal characters.")
     if section_mode not in {"all", "no-stripped", "only-stripped"}:
         raise RepairError(f"Unknown manifest section mode: {section_mode}")
     if patch_types_only and base_root is not None:
@@ -4668,6 +4786,16 @@ def run(
             raise RepairError(
                 f"Base Cache.Windows contains no usable H.<package>.toc files: {base_cache_dir}"
             )
+        fingerprint = base_toc_fingerprint(base_cache_dir)
+        print(f"[Base] H.TOC fingerprint: {fingerprint}")
+        if expected_base_fingerprint is not None:
+            if fingerprint != expected_base_fingerprint.casefold():
+                raise RepairError(
+                    "Original Steam base fingerprint differs from the supplied value "
+                    f"(expected {expected_base_fingerprint.lower()}, actual {fingerprint}). "
+                    "Verify that you selected the original unupdated Steam base."
+                )
+            print("[Base] H.TOC fingerprint matches the pinned value.")
 
     if openwf_log is None:
         log_path, openwf_objects, ignored_historical, openwf_session_found = (
@@ -4817,12 +4945,12 @@ def run(
         fontcache_already_selected = sum(
             1
             for asset in fontcache_assets
-            if (asset.namespace, asset.logical_path, asset.hash_b64) in repair_keys
+            if asset.key in repair_keys
         )
         proactive_fontcache = [
             asset
             for asset in fontcache_assets
-            if (asset.namespace, asset.logical_path, asset.hash_b64) not in repair_keys
+            if asset.key not in repair_keys
         ]
         repair_assets.extend(proactive_fontcache)
 
@@ -4962,21 +5090,8 @@ def run(
     manifest_section_results: dict[str, Counter[str]] = {
         section: Counter() for section in MANIFEST_SECTION_NAMES
     }
-    repair_started = time.monotonic()
-    for index, asset in enumerate(repair_assets, 1):
-        if full_completion and (index == 1 or index % 500 == 0):
-            total_candidates = len(repair_assets)
-            percent = (index * 100.0 / total_candidates) if total_candidates else 100.0
-            elapsed = max(0.0, time.monotonic() - repair_started)
-            rate = (index - 1) / elapsed if elapsed > 0 and index > 1 else 0.0
-            progress_label = "Stripped" if section_mode == "only-stripped" else "Completion"
-            speed = f" | {rate:.0f}/s" if rate > 0 else ""
-            print(
-                f"[{progress_label}] Processing {index}/{total_candidates} "
-                f"({percent:.1f}%){speed}..."
-            )
-
-        asset_key = (asset.namespace, asset.logical_path, asset.hash_b64)
+    for asset in repair_assets:
+        asset_key = asset.key
         result = planned_download_results.get(asset_key)
         if result is None:
             result = repair_manifest_asset(
@@ -5257,6 +5372,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--base-fingerprint",
+        metavar="SHA256",
+        help=(
+            "optional pinned SHA-256 H.TOC fingerprint of the original unupdated Steam "
+            "base (printed in a normal run); mismatch stops repair before patch writes"
+        ),
+    )
+    parser.add_argument(
         "-w",
         "--download-workers",
         type=int,
@@ -5284,6 +5407,11 @@ def main() -> int:
             )
         if not args.patch_types_only and args.base is None:
             parser.error("base path is required for repair")
+        if args.base_fingerprint is not None:
+            if args.patch_types_only:
+                parser.error("--base-fingerprint cannot be combined with --patch-types-only")
+            if re.fullmatch(r"[a-fA-F0-9]{64}", args.base_fingerprint) is None:
+                parser.error("--base-fingerprint requires exactly 64 hexadecimal characters")
 
         target_root = Path(args.root)
 
@@ -5301,6 +5429,7 @@ def main() -> int:
                 section_mode=section_mode,
                 stripped_output=args.stripped_output,
                 download_workers=args.download_workers,
+                expected_base_fingerprint=args.base_fingerprint,
             )
     except KeyboardInterrupt:
         print_warning("Interrupted by user.", file=sys.stderr)
